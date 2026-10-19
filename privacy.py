@@ -230,6 +230,27 @@ def mask_image(img_bytes):
     return out.getvalue(), len(areas), sorted(set(found))
 
 
+def ocr_text(img_bytes):
+    """Plain text of a picture (Tesseract, on this server) - used to read a pasted fare-rule screenshot when
+    no AI reads pictures. The text is masked like any other text. '' when Tesseract is not available."""
+    if not ocr_ready()[0]:
+        return ""
+    try:
+        import pytesseract
+        from PIL import Image, ImageOps, ImageStat
+        im = ImageOps.exif_transpose(Image.open(io.BytesIO(img_bytes))).convert("RGB")
+        if im.width < 1200 and im.width * im.height < 1_500_000:
+            im = im.resize((im.width * 2, im.height * 2))
+        g = ImageOps.grayscale(im)
+        if ImageStat.Stat(g).mean[0] < 110:                   # GDS screens: light text on dark
+            g = ImageOps.invert(g)
+        text = pytesseract.image_to_string(g, config="--psm 6", timeout=120)
+        text = re.sub(r"(?<=\d)@|@(?=\d)", "0", text)          # GDS fonts: a dotted 0 is often read as @
+        return mask(text)
+    except Exception:                                        # noqa: BLE001
+        return ""
+
+
 _done = {}          # sha256 of a checked picture -> masked PNG (so the same picture is checked once)
 
 

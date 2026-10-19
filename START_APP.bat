@@ -1,8 +1,8 @@
 @echo off
-title Vidya - Ask Vidya. Learn Faster. Work Smarter.
+title Vidya - Your AI Learning & Knowledge Assistant
 cd /d "%~dp0"
 echo ==================================================
-echo   Vidya - Ask Vidya. Learn Faster. Work Smarter.
+echo   Vidya - Your AI Learning & Knowledge Assistant
 echo ==================================================
 echo.
 echo Step 1 of 2: Checking the required libraries (first time takes 1-2 minutes)...

@@ -13,7 +13,8 @@ import config
 NAVY, BLUE, PURPLE, TEAL, ORANGE = "#0f1b3d", "#1F5FBF", "#6A3FB5", "#0F8A7E", "#E8743B"
 REGION_COLORS = {"NORAM": BLUE, "EUROPE": PURPLE, "APAC": TEAL, "GLOBAL": "#5b6475"}
 ASSETS = Path(__file__).parent / "assets"
-LOGO_FILE, ICON_FILE = ASSETS / "vidya_logo.png", ASSETS / "vidya_icon.png"
+ICON_FILE = ASSETS / "vidya_icon.png"            # round Vidya robot: browser tab + chat avatar
+ICON_WEB, HERO_WEB = ASSETS / "vidya_icon.webp", ASSETS / "vidya_hero.webp"   # header circle, welcome banner
 
 
 def _b64(path):
@@ -23,8 +24,8 @@ def _b64(path):
         return ""
 
 
-ICON_B64 = _b64(ICON_FILE)
-LOGO_B64 = _b64(LOGO_FILE)
+ICON_B64 = _b64(ICON_WEB)
+HERO_B64 = _b64(HERO_WEB)
 RESULT_BADGE = {"answered": ("Answered", "#e7f6ee", "#16794c"),
                 "not_found": ("Not found", "#fdecec", "#b42318"),
                 "conflict": ("Conflict", "#fff4e5", "#b54708")}
@@ -39,13 +40,18 @@ CSS = f"""
   [data-testid="stSegmentedControl"] button p {{font-weight:600;}}
   [data-testid="stSidebar"] {{background: #f6f8fc; border-right: 1px solid #e3e8f2;}}
   [data-testid="stSidebar"] .stRadio label p {{font-size: 0.95rem;}}
-  .om-top {{display:flex; align-items:center; gap:18px; padding:12px 22px; border-radius:14px;
+  .om-top {{display:flex; align-items:center; gap:18px; padding:10px 22px; border-radius:16px;
            background: linear-gradient(100deg, {NAVY} 0%, #1d3a8a 55%, #3b5bd6 100%); color:#fff;
            margin-bottom: 16px;}}
   .om-logo {{display:flex; align-items:center; gap:10px; font-size:1.6rem; font-weight:800;}}
-  .om-logo .ring {{width:44px; height:44px; border-radius:50%; background:#fff; color:{NAVY};
-                   display:flex; align-items:center; justify-content:center; font-size:1.2rem; overflow:hidden;}}
-  .om-logo .ring img {{width:40px; height:40px;}}
+  .om-logo .ring {{width:54px; height:54px; border-radius:50%; background:#fff; color:{NAVY};
+                   display:flex; align-items:center; justify-content:center; font-size:1.2rem; overflow:hidden;
+                   box-shadow:0 0 0 3px rgba(255,255,255,.25);}}
+  .om-logo .ring img {{width:52px; height:52px;}}
+  .om-checks {{background:#f2f6ff; border:1px solid #c9d8f5; border-left:6px solid {BLUE}; border-radius:10px;
+               padding:10px 14px; margin:10px 0; font-size:.9rem;}}
+  .om-checks b.t {{display:block; margin-bottom:4px; color:{NAVY};}}
+  .om-checks ol {{margin:0; padding-left:20px;}}
   .om-ticker {{background:#fff1f0; border:1px solid #f4b4b0; border-left:6px solid #d92d20; border-radius:10px;
               overflow:hidden; white-space:nowrap; margin:0 0 14px; display:flex; align-items:center;}}
   .om-ticker .lbl {{background:#d92d20; color:#fff; font-weight:800; padding:8px 14px; flex:none; z-index:1;}}
@@ -54,8 +60,7 @@ CSS = f"""
   .om-ticker:hover .run {{animation-play-state: paused;}}
   .om-ticker .sep {{color:#f04438; margin:0 22px;}}
   @keyframes om-run {{ from {{transform: translateX(0);}} to {{transform: translateX(-100%);}} }}
-  .om-brand {{text-align:center; padding:6px 0 2px;}}
-  .om-brand img {{width:240px; max-width:70%;}}
+  .om-hero-img {{position:absolute; right:10px; bottom:0; height:100%; max-height:150px; width:auto;}}
   .om-tag {{opacity:.85; border-left:1px solid rgba(255,255,255,.35); padding-left:14px;}}
   .om-sp {{flex:1}}
   .om-pill {{background:rgba(255,255,255,.14); border:1px solid rgba(255,255,255,.25);
@@ -64,12 +69,13 @@ CSS = f"""
   .om-av {{width:34px; height:34px; border-radius:50%; background:#fff; color:{BLUE};
            display:flex; align-items:center; justify-content:center; font-weight:700;}}
   .om-motto {{font-weight:700; letter-spacing:.02em; opacity:.95}}
-  .om-hero {{border-radius:16px; padding:18px 28px 16px; color:#fff; position:relative; overflow:hidden;
+  .om-hero {{border-radius:16px; padding:22px 300px 22px 28px; min-height:150px; color:#fff; position:relative;
+            overflow:hidden; display:flex; flex-direction:column; justify-content:center;
             background: linear-gradient(115deg, #0e1a3c 0%, #23367a 40%, #c9643f 82%, #f6b26b 100%);}}
   .om-hero h1 {{font-size:1.5rem !important; line-height:1.2; margin:0 0 8px; color:#fff !important; padding:0 !important;}}
-  .om-hero h1 span {{color:#8fb8ff !important;}}
+  .om-hero h1 span {{color:#6cc4ff !important;}}
   .om-hero p {{margin:0; opacity:.92; font-size:.95rem; color:#fff !important;}}
-  .om-hero svg {{position:absolute; right:24px; top:8px; height:78px; width:150px; opacity:.9}}
+  @media (max-width: 900px) {{ .om-hero {{padding-right:28px;}} .om-hero-img {{display:none;}} }}
   .om-card {{background:#fff; border:1px solid #e3e8f2; border-radius:14px; padding:16px 18px; margin-bottom:12px;}}
   .om-card h4 {{margin:0 0 10px; font-size:1rem;}}
   .om-badge {{display:inline-block; padding:2px 10px; border-radius:999px; font-size:.75rem; font-weight:700;}}
@@ -100,13 +106,7 @@ CSS = f"""
 </style>
 """
 
-PLANE_SVG = """<svg width="230" height="120" viewBox="0 0 230 120" xmlns="http://www.w3.org/2000/svg">
-<path d="M10 92 L220 92" stroke="rgba(255,255,255,.35)" stroke-width="2" stroke-dasharray="10 8"/>
-<g transform="translate(118 40) rotate(-12)" fill="#fff">
-<path d="M-70 4 L40 -4 C52 -5 62 0 62 4 C62 8 52 13 40 12 L-70 6 Z"/>
-<path d="M-5 0 L-35 -38 L-22 -38 L18 -2 Z"/><path d="M-5 8 L-35 46 L-22 46 L18 10 Z"/>
-<path d="M-62 3 L-74 -16 L-66 -16 L-50 3 Z"/></g>
-<circle cx="200" cy="24" r="10" fill="rgba(255,214,140,.9)"/></svg>"""
+
 
 
 def setup():
@@ -132,14 +132,7 @@ def topbar(user, role, region):
 
 
 def _icon():
-    return f"<img src='data:image/png;base64,{ICON_B64}' alt='Vidya'>" if ICON_B64 else "✈"
-
-
-def brand():
-    """The full Vidya logo (sign-in page)."""
-    if LOGO_B64:
-        st.markdown(f"<div class='om-brand'><img src='data:image/png;base64,{LOGO_B64}' alt='Vidya - "
-                    f"{esc(config.TAGLINE)}'></div>", unsafe_allow_html=True)
+    return f"<img src='data:image/webp;base64,{ICON_B64}' alt='Vidya'>" if ICON_B64 else "V"
 
 
 def ticker(items):
@@ -204,10 +197,11 @@ def card_guard():
 
 
 def hero(first_name):
+    """Welcome banner: navy-to-orange, Vidya robot reading on the right."""
+    img = (f"<img class='om-hero-img' src='data:image/webp;base64,{HERO_B64}' alt=''>" if HERO_B64 else "")
     st.markdown(
-        f"<div class='om-hero'>{PLANE_SVG}<h1>Hi {esc(first_name)}, how can <span>{config.APP_NAME}</span> "
-        f"help you today?</h1><p>Ask anything about products, processes, systems or policies.</p></div>",
-        unsafe_allow_html=True)
+        f"<div class='om-hero'>{img}<h1>Hi {esc(first_name)}, how can <span>{config.APP_NAME}</span> "
+        f"help you today?</h1><p>{esc(config.WELCOME_TEXT)}</p></div>", unsafe_allow_html=True)
 
 
 def region_pill(region):
@@ -237,6 +231,13 @@ def card(title, body_html):
     st.markdown(f"<div class='om-card'><h4>{title}</h4>{body_html}</div>", unsafe_allow_html=True)
 
 
+def checks(items):
+    """The three checks shown with every fare-penalty answer."""
+    rows = "".join(f"<li><b>{esc(t)}:</b> {esc(d)}</li>" for t, d in items)
+    st.markdown(f"<div class='om-checks'><b class='t'>✅ Before you process - check these 3 things</b>"
+                f"<ol>{rows}</ol></div>", unsafe_allow_html=True)
+
+
 def avatar():
     """Vidya's face for her chat messages (falls back to a plane if the logo file is missing)."""
-    return str(ICON_FILE) if ICON_FILE.exists() else "✈️"
+    return str(ICON_FILE) if ICON_FILE.exists() else "📘"

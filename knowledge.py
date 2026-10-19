@@ -29,6 +29,7 @@ import config
 import llm
 import privacy
 import rerank
+import farerule
 
 # ===========================================================================
 # 1. DATABASE
@@ -1197,6 +1198,46 @@ def _lex_index(hit, items):
 _COMPARE = re.compile(r"\b(difference|differences|compare|comparison|versus|vs\.?)\b", re.I)
 
 
+def _store_question(region, asked_by, question, answer, sources, status, meta, topic, result, conf, pct,
+                    sme_reason, image=None, score=0.0):
+    with _conn() as con:
+        cur = con.execute(
+            "INSERT INTO questions (region, asked_by, question, answer, sources, score, status, asked_at,"
+            " meta, topic, result, confidence, gap_status, lob, sub_lob, confidence_pct, sme_reason)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (region, asked_by, question + (" [screenshot]" if image else ""), answer, json.dumps(sources), score,
+             status, _now(), json.dumps(meta), topic, result, conf, None if result == "answered" else "Open",
+             meta.get("lob", region), meta.get("sub_lob", ""), pct, sme_reason))
+        qid = cur.lastrowid
+        if image:
+            path = config.UPLOAD_DIR / f"question_{qid}.png"
+            path.write_bytes(image)
+            con.execute("UPDATE questions SET image_path=? WHERE id=?", (str(path), qid))
+    return qid
+
+
+def _fare_rule_answer(region, question, shot_text, asked_by, image, sub_lob, meta, t0):
+    """The agent pasted a fare rule (or a screenshot of one): answer from THAT text, not the documents."""
+    fr = farerule.answer(question + "\n" + shot_text, from_screenshot=bool(image))
+    ask = fr["ask"] or "Fare rule - which penalty applies?"
+    determined = fr["determined"]
+    conf, pct = ("high", 92) if determined else ("medium", 60)
+    if image and not llm.vision_on():
+        conf, pct = "medium", min(pct, 75)              # amounts read by text recognition: check on screen
+    sme_reason = None if determined else "Fare rule not clear for every case"
+    meta.update({"mode": "fare rule", "format": "short", "topic": "Fares", "lob": region, "sub_lob": sub_lob or "",
+                 "seconds": round(time.time() - t0, 1), "did_you_mean": "", "documents": 0, "important": "",
+                 "confidence_pct": pct, "supporting_docs": 0, "other_lob": "", "images": [],
+                 "checks": farerule.CHECKS, "fare_rule": fr["scenario"], "sme_review": bool(sme_reason)})
+    meta["layers"].append("fare rule reader")
+    meta["notes"].append("Answer read from the fare rule you pasted - not from the SOP documents.")
+    stored_q = ask + "\n[fare rule pasted]\n" + (question if not shot_text else shot_text)[:1500]
+    qid = _store_question(region, asked_by, stored_q, fr["answer"], [], "needs_review" if sme_reason else "answered",
+                          meta, "Fares", "answered", conf, pct, sme_reason, image)
+    return {"id": qid, "answer": fr["answer"], "sources": [], "result": "answered", "found": True,
+            "confidence": conf, "confidence_pct": pct, "meta": meta, "question": ask, "images": []}
+
+
 def _parts_missing(r, parts):
     """True when the one answer to the whole question leaves a part uncovered (or nothing was found).
     A question that matches an FAQ / SME answer as a whole, or asks for a comparison, stays whole."""
@@ -1245,6 +1286,43 @@ def _combine_parts(subs):
     return {"answer": "\n\n".join(blocks), "hits": hits, "best": best, "cover": (worst or {}).get("cover", 1.0),
             "conf": "medium" if missing else worst_conf, "mode": (worst or {}).get("mode", "documents"),
             "important": " ".join(imp)[:400], "notes": notes, "pcts": pcts, "missing": missing, "parts": parts}
+
+
+_GENERIC = set("""today tomorrow yesterday after before first second third right wrong again still other
+always never every where which there their about should could would might people things thing""".split())
+
+
+def faq_question_cover(region, question_core, hit):
+    """For an FAQ piece ("Q: ... A: ..."): None when it is a fair match, else the share of the agent's key
+    words in the piece, rare words counting more. An FAQ is held back only when the MOST SPECIFIC word of
+    the question ("merchant", "reprint", "Germany") is nowhere in it - a common word ("card", "error",
+    "blocked") must not make an unrelated FAQ look like the answer. Exact FAQ matches are never checked."""
+    text = (hit.get("text") or "").lstrip()
+    if hit.get("kind") != "doc" or not text.startswith("Q:") or hit.get("faqsim", 0) >= 0.8:
+        return None
+    words = list(dict.fromkeys(brain.content_words(question_core)))
+    if len(words) < 2:
+        return None
+    lex = (_CACHE.get(next((k for k in _CACHE if k[0] == region and not k[1]), None)) or {}).get("lex")
+    if not lex:
+        return None
+    ix = lex["words"]
+
+    def weight(w):
+        j = ix.vocab.get(_norm(w))
+        df = ix.df[j] if j is not None else 0
+        return float(np.log((1.0 + ix.n) / (1.0 + df)) + 1.0)
+    weights = {w: weight(w) for w in words}
+    present = {w for w in words if brain.coverage(w, hit.get("search", text)) >= 1.0}
+    specific = [w for w in words if len(w) >= 5 and w not in _GENERIC]   # "next", "day", "today" are not terms
+    if not specific:
+        return None
+    rarest = max(specific, key=lambda w: weights[w])
+    if rarest in present:
+        return None
+    if ix.vocab.get(_norm(rarest)) is None:
+        return 0.75          # no document mentions it at all ("Emirates"): a general method may still apply
+    return sum(weights[w] for w in present) / sum(weights.values())   # another document is about it
 
 
 def _doc_label(h):
@@ -1494,8 +1572,17 @@ def ask(region, question, asked_by, image=None, sub_lob=None, clarify=True, _par
             except llm.AIError as e:
                 meta["notes"].append(str(e))
         else:
-            meta["notes"].append("Screenshots are read only by an AI that reads pictures "
-                                 "(Gemini/Claude key, or LOCAL_VISION_MODEL for local AI).")
+            ocr = privacy.ocr_text(image)                  # no AI: a fare-rule screenshot is still read (Tesseract)
+            if ocr and farerule.detect(ocr):
+                shot_text = ocr
+                meta["layers"].append("read screenshot (text recognition)")
+            else:
+                meta["notes"].append("Screenshots are read only by an AI that reads pictures "
+                                     "(Gemini/Claude key, or LOCAL_VISION_MODEL for local AI).")
+
+    # --- A pasted fare rule (category 16): read it and say which fee applies -------------------
+    if not _part and farerule.detect(question + "\n" + shot_text):
+        return _fare_rule_answer(region, question, shot_text, asked_by, image, sub_lob, meta, t0)
     if not question:
         question = shot_issue or "What does this screenshot mean and what should I do?"
 
@@ -1629,6 +1716,9 @@ def ask(region, question, asked_by, image=None, sub_lob=None, clarify=True, _par
             cf = brain.offline_confidence(b["lex"], c, None, len(brain.content_words(st)))
             if b["kind"] == "learned" and (cf == "medium" or (b["lex"] >= 0.25 and c >= 0.5)):
                 cf = "high" if cf == "medium" else "medium"
+            wq = faq_question_cover(region, st, b)
+            if wq is not None:                  # the most specific word of the question is not in this FAQ
+                cf = "low" if wq < 0.6 else ("medium" if cf == "high" else cf)
             res = {"hits": h, "best": b, "cover": c, "conf": cf, "result": "not_found",
                    "answer": None, "conflict_pair": None}
             pair = brain.offline_conflict(st, h) if cf != "low" else None
@@ -1773,6 +1863,8 @@ def ask(region, question, asked_by, image=None, sub_lob=None, clarify=True, _par
     elif pct is not None and pct < config.SME_REVIEW_BELOW_PCT and not from_verified:
         sme_reason = f"Low confidence ({pct}%)"
     meta["sme_review"] = bool(sme_reason) and result == "answered"
+    if farerule.is_penalty_question(question):
+        meta["checks"] = farerule.CHECKS                # the three checks for every fare-penalty question
     status = "needs_review" if sme_reason else "answered"
     with _conn() as con:
         cur = con.execute(

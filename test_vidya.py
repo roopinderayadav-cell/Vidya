@@ -795,3 +795,75 @@ def test_multi_part_question_is_answered_part_by_part():
     assert why.startswith("Partly answered")
     assert kb.brain.split_parts("how to void and refund a ticket in amadeus") == \
         ["how to void and refund a ticket in amadeus"]                         # one question stays one
+
+
+def test_faq_is_not_used_when_the_specific_word_is_missing():
+    faq = ("EU card FAQ\nQ: Invalid card number length error\nA: Request a valid card number from OPS and update the CCCB line.\n"
+           "Q: Merchant credit card details in Amadeus\nA: Amadeus: RTF.\n"
+           "Q: Which are the new Germany agencies?\nA: The new Germany agencies are 0144 and 0811.\n"
+           "Q: Customer not available error\nA: Dispatch the PNR to OPS for a valid customer number.")
+    kb.add_document("EUROPE", "FAQ", "EU card FAQ", "eucard.txt", faq.encode(), "admin")
+    r = kb.ask("EUROPE", "Germany: AGM reprint not available - which system do I use?", "t", clarify=False)
+    assert r["result"] != "answered" or "customer number" not in (r["answer"] or "")   # not the unrelated FAQ
+    r = kb.ask("EUROPE", "invalid card number length error", "t", clarify=False)
+    assert r["result"] == "answered" and "CCCB" in r["answer"]                        # the right FAQ still answers
+
+
+def test_fare_rule_reader_gets_the_right_fee_for_every_sample_case():
+    import json
+    from pathlib import Path
+    import farerule
+    here = Path(__file__).parent / "tests_data"
+    samples = json.loads((here / "fare_rules_samples.json").read_text())
+    expected = json.loads((here / "fare_rules_expected.json").read_text())
+    for name, cases in expected.items():
+        for case, want in cases.items():
+            r = farerule.answer(samples[name] + "\n" + case + " fee?")
+            head = r["answer"].split("\n")[0].replace("**", "")
+            assert want.lower() in head.lower(), (name, case, head)
+
+
+def test_pasted_fare_rule_is_answered_with_the_three_checks():
+    import json
+    from pathlib import Path
+    rule = json.loads((Path(__file__).parent / "tests_data" / "fare_rules_samples.json").read_text())
+    r = kb.ask("EUROPE", rule["amadeus_5_LH_nonref_EUR80"] + "\nwhat is the change fee before departure?", "t")
+    assert r["result"] == "answered" and r["meta"]["mode"] == "fare rule"
+    assert "EUR 80.00" in r["answer"] and "CHARGE EUR 80.00 FOR REISSUE/REVALIDATION" in r["answer"]
+    assert [t for t, _ in r["meta"]["checks"]] == ["Verify Penalties", "Check Ticket Status", "Check PNR history"]
+    with kb._conn() as con:
+        saved = con.execute("SELECT question FROM questions WHERE id=?", (r["id"],)).fetchone()[0]
+    assert saved.startswith("what is the change fee before departure?")
+    p = kb.ask("NORAM", "what is the no show penalty for a refund", "t", clarify=False)   # from the documents
+    assert p["meta"].get("checks") and p["meta"]["mode"] != "fare rule"
+    assert not kb.ask("NORAM", "what is TTP", "t")["meta"].get("checks")                  # only penalty questions
+
+
+def test_fare_rule_screenshot_is_read_without_ai():
+    import json
+    from pathlib import Path
+    from PIL import Image, ImageDraw, ImageFont
+    import io
+    rule = json.loads((Path(__file__).parent / "tests_data" / "fare_rules_samples.json").read_text())["sabre_4_BA_GBP300_before_after"]
+    lines = [l for l in rule.splitlines() if l.strip()][:40]
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 18)
+    except OSError:
+        pytest.skip("no font")
+    im = Image.new("RGB", (900, 26 * len(lines) + 20), "white")
+    d = ImageDraw.Draw(im)
+    for i, l in enumerate(lines):
+        d.text((10, 10 + 26 * i), l, fill="black", font=font)
+    buf = io.BytesIO(); im.save(buf, "PNG")
+    if not kb.privacy.ocr_ready()[0]:
+        pytest.skip("Tesseract not installed")
+    r = kb.ask("EUROPE", "refund before departure?", "t", image=buf.getvalue())
+    assert r["meta"]["mode"] == "fare rule" and "GBP 300" in r["answer"] and "screenshot" in r["answer"]
+
+
+def test_no_plane_left_in_the_screens():
+    from pathlib import Path
+    here = Path(__file__).parent
+    for f in ("ui.py", "app.py", "config.py", "admin_pages.py"):
+        assert "\u2708" not in (here / f).read_text(encoding="utf-8"), f
+    assert (here / "assets" / "vidya_hero.webp").exists() and (here / "assets" / "vidya_icon.webp").exists()

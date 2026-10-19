@@ -10,13 +10,14 @@ import streamlit as st
 import admin_pages
 import brain
 import config
+import farerule
 import knowledge as kb
 import privacy
 import llm
 import ui
 
 st.set_page_config(page_title=f"{config.APP_NAME} - {config.TAGLINE}",
-                   page_icon=str(ui.ICON_FILE) if ui.ICON_FILE.exists() else "✈️", layout="wide")
+                   page_icon=str(ui.ICON_FILE) if ui.ICON_FILE.exists() else "📘", layout="wide")
 ui.setup()
 ui.card_guard()          # card numbers are masked inside every text box while they are typed / pasted
 import rerank            # noqa: E402
@@ -89,7 +90,6 @@ if not ss.user:
                     ss.is_admin, ss.is_sme = role.startswith("Admin"), role.startswith(("SME", "Admin"))
                     st.rerun()
     with right:
-        ui.brand()
         ui.card("How Vidya works", "<ol style='margin:0;padding-left:18px;line-height:1.9'>"
                 "<li>Pick your region and a topic, or just type your question</li>"
                 "<li>Spelling mistakes and Hindi / Kannada / Telugu in English letters are fine</li>"
@@ -230,6 +230,8 @@ def render_answer(msg, i):
         if meta.get("important"):
             st.markdown(f"<div class='om-important'>❗ <b>Important:</b> {ui.esc(meta['important'])}</div>",
                         unsafe_allow_html=True)
+    if meta.get("checks"):
+        ui.checks(meta["checks"])
         if meta.get("learned"):
             st.caption("🧠 From an answer Vidya learned (SME / process team / staff 👍)")
         if meta.get("sme_review"):
@@ -238,14 +240,15 @@ def render_answer(msg, i):
     if result != "not_found":
         show_sources(msg.get("sources"), f"{region}{i}")
     where = meta.get("other_lob") or region
-    bits = [f"Answer based on {where} documents" + (f" · {meta['sub_lob']} first" if meta.get("sub_lob") else "")]
+    bits = (["Answer read from the fare rule you pasted"] if meta.get("mode") == "fare rule" else
+            [f"Answer based on {where} documents" + (f" · {meta['sub_lob']} first" if meta.get("sub_lob") else "")])
     if msg.get("confidence") and result == "answered":
         pct = msg.get("confidence_pct")
         bits.append(f"Confidence: **{pct}%** ({msg['confidence'].title()})" if pct is not None
                     else f"Confidence: **{msg['confidence'].title()}**")
         if meta.get("supporting_docs", 0) > 1:
             bits.append(f"supported by {meta['supporting_docs']} documents")
-    bits.append("🤖 AI" if meta.get("mode") == "ai" else "📄 documents")
+    bits.append({"ai": "🤖 AI", "fare rule": "📋 fare rule reader"}.get(meta.get("mode"), "📄 documents"))
     if meta.get("seconds") is not None:
         bits.append(f"⏱ {meta['seconds']} s")
     if meta.get("followup"):
@@ -355,7 +358,13 @@ def page_ask():
                     if msg.get("image"):
                         st.image(msg["image"], width=320)
                     if msg["role"] == "user":
-                        st.markdown(privacy.mask_md(msg["content"]))
+                        if farerule.detect(msg["content"]):          # a pasted fare rule: question + folded rule
+                            ask, rule = farerule.split_question(msg["content"])
+                            st.markdown(privacy.mask_md(ask or "Which penalty applies?"))
+                            with st.expander(f"📋 Fare rule pasted ({len(rule.splitlines())} lines)"):
+                                st.code(privacy.mask(rule), language=None)
+                        else:
+                            st.markdown(privacy.mask_md(msg["content"]))
                         if msg.get("lob"):
                             st.caption(f"LOB: {msg['lob']}")
                     else:

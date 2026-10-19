@@ -1,9 +1,33 @@
-# Vidya v5.1 - Ask Vidya. Learn Faster. Work Smarter. (NORAM · EUROPE · APAC)
+# Vidya v5.2 - Your AI Learning & Knowledge Assistant (NORAM · EUROPE · APAC)
 
 Vidya is the team's AI knowledge assistant (formerly iKnow / OpsMate). Agents ask questions in
 plain words (typos and Hindi/Kannada/Telugu in English letters are fine) or paste a screenshot,
 and get one short answer with its SOP source and a confidence level. When Vidya is not sure it
 says: "I do not have answer to this question, please consult with your team supervisor."
+
+## What's new in Vidya v5.2 - new look and the Fare Rule Reader
+- **New look:** the Vidya robot in the header (round icon), the welcome banner with the robot reading,
+  tagline "Your AI Learning & Knowledge Assistant", the robot as chat avatar and browser-tab icon. No plane
+  anywhere. Images: `assets/vidya_icon.png` (tab / avatar), `assets/vidya_icon.webp` (header),
+  `assets/vidya_hero.webp` (banner). The old `assets/vidya_logo.png` is no longer used.
+- **Fare Rule Reader:** the agent pastes the fare rule (category 16 PENALTIES - Amadeus FQN/TQN PE, Sabre RD
+  *PN) into the question box, with or without a question ("change before departure fee?", "pax no show,
+  refund?"). Vidya answers from THAT text, not the documents:
+  - the fee that applies (e.g. **GBP 300.00** cancellation fee), or Non-refundable / Not permitted /
+    Permitted - no fee in the rule; one case when the question says it, otherwise a table of all six cases
+    (change / refund x before departure / after departure / no-show);
+  - the conditions found in the rule: fare difference, residual value, per ticket / transaction / fare
+    component, highest penalty or sum when fares are combined, taxes / YQ / YR, EMD collection, deadline,
+    child / infant, waivers, exceptions (e.g. visa rejection);
+  - the exact rule lines it used, and "Not clear from the rule text" when the rule does not say - never a
+    guessed fee (those go to the SME Desk).
+  A screenshot of the rule is also read (Tesseract, no AI needed) - every amount then carries "read from a
+  screenshot - check the amount on screen", because text recognition can misread 0 as 8. Pasting the text
+  is exact. Tested on 10 real Amadeus / Sabre fare rules (BA, LH, SQ, IB, DL ...): 51 of 51 cases right.
+- **Three checks with every fare-penalty answer** (pasted rule or question about penalties / no-show /
+  refundable / fare rules): Verify Penalties · Check Ticket Status · Check PNR history.
+- Search: an FAQ is not used when the most specific word of the question (e.g. "merchant", "Germany")
+  is missing from it.
 
 ## What's new in Vidya v5.1 - smarter answers, stricter card masking
 - **Card numbers: 13 digits too.** Any run of 13 to 19 digits (spaces / hyphens allowed), whatever its
@@ -74,6 +98,8 @@ says: "I do not have answer to this question, please consult with your team supe
 | `assets/` | Vidya logo and icon |
 | `knowledge.py` | Documents, search, 3-layer answering, self-learning, gaps, Excel export |
 | `brain.py` | Spelling/Hinglish, topics, confidence, conflict check, short answers |
+| `farerule.py` | Fare Rule Reader: reads a pasted category 16 and says which fee applies |
+| `tests_data/` | 10 sample fare rules + expected answers (used by the tests) |
 | `rerank.py` | Reranker model (second look at the best passages), loads in the background |
 | `llm.py` | Connection to Gemini, Claude or local AI (Ollama) + built-in meaning search (all optional) |
 | `LOCAL_AI_SETUP.md` | How to run AI with no key (Ollama + built-in meaning search) |

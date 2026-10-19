@@ -1,0 +1,23 @@
+Vidya v5.2 - update your Vidya GitHub repository (the one set up from v5.1)
+============================================================================
+
+1. Unzip this file.
+2. GitHub -> your PRIVATE "vidya" repository -> "Add file" -> "Upload files".
+   Drag in everything from this folder (keep the folders "assets" and "tests_data" as they are):
+      app.py, ui.py, config.py, knowledge.py, privacy.py, farerule.py (NEW), test_vidya.py,
+      README.md, START_APP.bat,
+      assets/vidya_icon.png, assets/vidya_icon.webp (NEW), assets/vidya_hero.webp (NEW),
+      tests_data/fare_rules_samples.json (NEW), tests_data/fare_rules_expected.json (NEW)
+   (This UPLOAD_STEPS.txt does not need to go in.)
+3. Delete the old logo, it is no longer used:
+      assets/vidya_logo.png  -> open it -> ... -> Delete file -> Commit changes
+4. Commit message:  Vidya v5.2 - new look, Fare Rule Reader, three penalty checks
+5. Streamlit updates the app by itself in 1-2 minutes (if not: ... -> Reboot app).
+
+No change to Secrets, requirements.txt or packages.txt.
+
+Check after the update:
+   - Sign-in page: robot in the header, banner "Hi there, how can Vidya help you today?" with the robot reading.
+   - Paste a fare rule (category 16 from Amadeus or Sabre) into the question box and add
+     "change before departure fee?" - Vidya answers with the fee, the rule lines it used and the 3 checks.
+   - Ask "what is the no show penalty" - the 3 checks show under the answer.

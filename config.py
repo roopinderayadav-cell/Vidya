@@ -44,7 +44,8 @@ def _secret(name, default=""):
 
 # ---- App identity ---------------------------------------------------------
 APP_NAME = "Vidya"
-TAGLINE = "Ask Vidya. Learn Faster. Work Smarter."
+TAGLINE = "Your AI Learning & Knowledge Assistant"
+WELCOME_TEXT = "Get instant answers from your learning resources — SOPs, FAQs, guides, documents and more."
 COMPANY_NAME = "Your Company"
 
 # ---- The two standard replies (edit the wording here) -----------------------
@@ -90,7 +91,7 @@ TOPICS = {
     "Quality / Errors": "error errors adm quality debit memo mistake issue failed invalid",
 }
 TOPIC_LABELS = {"GDS (Amadeus/Sabre)": "GDS", "Quality / Errors": "Quality"}   # short button text
-TOPIC_ICONS = {"Ticketing": "✈️", "Refunds": "💸", "Exchanges": "🔄", "OBT": "🧳", "Invoicing": "🧾",
+TOPIC_ICONS = {"Ticketing": "🎫", "Refunds": "💸", "Exchanges": "🔄", "OBT": "🧳", "Invoicing": "🧾",
                "Fare Rules": "📜", "GDS (Amadeus/Sabre)": "🖥️", "Profiles": "👤",
                "Travel Policy": "📋", "Quality / Errors": "⚠️"}
 
