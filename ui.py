@@ -13,8 +13,16 @@ import config
 NAVY, BLUE, PURPLE, TEAL, ORANGE = "#0f1b3d", "#1F5FBF", "#6A3FB5", "#0F8A7E", "#E8743B"
 REGION_COLORS = {"NORAM": BLUE, "EUROPE": PURPLE, "APAC": TEAL, "GLOBAL": "#5b6475"}
 ASSETS = Path(__file__).parent / "assets"
-ICON_FILE = ASSETS / "vidya_icon.png"            # round Vidya robot: browser tab + chat avatar
-ICON_WEB, HERO_WEB = ASSETS / "vidya_icon.webp", ASSETS / "vidya_hero.webp"   # header circle, welcome banner
+
+
+def _asset(name):
+    """Image from the assets folder, or from the main folder if it was uploaded there."""
+    in_folder = ASSETS / name
+    return in_folder if in_folder.exists() else Path(__file__).parent / name
+
+
+ICON_FILE = _asset("vidya_icon.png")             # round Vidya robot: browser tab + chat avatar
+ICON_WEB, HERO_WEB = _asset("vidya_icon.webp"), _asset("vidya_hero.webp")   # header circle, welcome banner
 
 
 def _b64(path):
