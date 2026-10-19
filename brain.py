@@ -240,13 +240,16 @@ long take takes time timeline many much come does happen kya hai have has had gi
 _SOFT = set("""check checking find see show use using make way gds system systems command commands cmd entry
 entries format formats tool tools screen look looks looking like image images picture pictures pic sample
 samples example examples screenshot refer reference europe noram apac qbay global region lob
-difference between versus compare""".split())
+difference between versus compare shows showing showed displays displayed appears appearing getting coming
+comes happens happened happening meaning means mean saying says""".split())
 
 
 def coverage(question, text):
     """Share of the question's important words that appear in the passage."""
     norm = lambda x: re.sub(r"(\d),(\d{3})", r"\1\2", x.lower())
     q = {w for w in re.findall(r"[a-z0-9]+", norm(question)) if len(w) > 2 and w not in _STOP}
+    if len(q - _SOFT) < 2:               # "segment shows HX": the 2-letter code IS the subject - count it
+        q |= {w.lower() for w in re.findall(r"\b[A-Z0-9]{2}\b", question or "")} - _STOP
     if len(q - _SOFT) >= 2:              # ignore generic words only when 2+ specific words remain
         q = q - _SOFT
     if not q:
@@ -265,7 +268,11 @@ def coverage(question, text):
 
 
 def content_words(question):
+    # 2-letter codes typed in capitals count as key words: HX, UN, KK, HK, QR (status codes, airlines)
     words = [w for w in re.findall(r"[a-z0-9]+", question.lower()) if len(w) > 2 and w not in _STOP]
+    if len([w for w in words if w not in _SOFT]) < 2:     # "segment shows HX": the code is the subject
+        codes = {w.lower() for w in re.findall(r"\b[A-Z0-9]{2}\b", question or "")} - _STOP
+        words += [w for w in re.findall(r"[a-z0-9]+", question.lower()) if w in codes and w not in words]
     hard = [w for w in words if w not in _SOFT]
     return hard if len(hard) >= 2 else words
 

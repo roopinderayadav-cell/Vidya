@@ -366,6 +366,8 @@ def test_sme_answer_is_used_next_time_and_documents_unchanged():
     kb.sme_answer(g["ids"], "NORAM", "Traveller cannot log in to the OBT",
                   "1. Ask the traveller to reset the password.\n2. Still locked: raise a ticket to OBT support.", "Priya")
     assert not [x for x in kb.sme_queue("NORAM") if x["question"] == "obt login issue"]
+    assert not [h for h in kb.search("NORAM", ["obt login issue"]) if h["kind"] == "learned"]   # not used yet
+    kb.approve_answer(kb.pending_answers("NORAM")[0]["id"], "Admin")
     for q in ("obt login issue", "traveller not able to login obt"):
         r = kb.ask("NORAM", q, "a3")
         assert r["result"] == "answered" and "reset the password" in r["answer"]
@@ -383,6 +385,7 @@ def test_low_confidence_goes_to_sme_and_can_be_confirmed(monkeypatch):
     g = [g for g in kb.sme_queue("NORAM") if g["question"] == "what is TTP"][0]
     assert g["reasons"][0].startswith("Low confidence (")
     kb.sme_confirm(g["ids"], "Priya")
+    kb.approve_answer(kb.pending_answers("NORAM")[0]["id"], "Admin")
     r2 = kb.ask("NORAM", "what is TTP", "a2")
     assert r2["meta"]["learned"] and not r2["meta"]["sme_review"]    # SME-confirmed answer is not re-queued
     monkeypatch.setattr(config, "SME_REVIEW_BELOW_PCT", 0)
@@ -429,6 +432,7 @@ def test_live_chat_saves_answers_for_next_time():
     assert len(pairs) == 1 and "FFAA1234567" in pairs[0]["answer"] and "Hi" not in pairs[0]["answer"]
     pairs[0]["question"] = "How to add a frequent flyer number in Sabre"
     assert kb.save_chat_pairs(cid, pairs, "Priya") == 1 and not kb.chats_to_review(sme="Priya")
+    kb.approve_answer(kb.pending_answers("NORAM")[0]["id"], "Admin")
     r = kb.ask("NORAM", "add frequent flyer number sabre", "Ravi")
     assert r["result"] == "answered" and "FFAA1234567" in r["answer"]
     texts = [m["text"] for m in kb.chat_messages(cid)]
@@ -905,9 +909,10 @@ def _voted_question():
 
 
 def _auto(active_only=True):
+    """Auto-learned answers in use or waiting for the admin (active_only=False: all rows)."""
     with kb._conn() as con:
         return con.execute("SELECT COUNT(*) FROM learned WHERE source='auto'"
-                           + (" AND active=1" if active_only else "")).fetchone()[0]
+                           + (" AND (active=1 OR status='pending')" if active_only else "")).fetchone()[0]
 
 
 def test_learning_needs_10_agents_2_smes_and_80_percent():
@@ -956,3 +961,66 @@ def test_feedback_report_has_names_and_downloads():
     wb = openpyxl.load_workbook(io.BytesIO(kb.report_excel(rep, votes)))
     assert wb.sheetnames == ["Questions & feedback", "All votes (who rated)"]
     assert wb["All votes (who rated)"].max_row == len(votes) + 1
+
+
+# ---------------------------------------------------------------- v5.4: admin approves SME answers, approval log
+def test_sme_answer_waits_for_admin_and_can_be_edited_or_rejected():
+    for who in ("a1", "a2"):
+        kb.ask("NORAM", "obt login issue", who)
+    g = [g for g in kb.sme_queue("NORAM") if g["question"] == "obt login issue"][0]
+    kb.sme_answer(g["ids"], "NORAM", "Traveller cannot log in to the OBT", "Reset the password.", "Priya")
+    p = kb.pending_answers("NORAM")
+    assert len(p) == 1 and p[0]["added_by"] == "Priya" and p[0]["asked"]["asked_by"] in ("a1", "a2")
+    assert not [h for h in kb.search("NORAM", ["traveller cannot log in to the obt"]) if h["kind"] == "learned"]
+    kb.approve_answer(p[0]["id"], "Admin", answer="1. Reset the password.\n2. Still locked: raise an OBT ticket.")
+    r = kb.ask("NORAM", "traveller cannot log in to the OBT", "a4")
+    assert r["result"] == "answered" and "raise an OBT ticket" in r["answer"]
+    log = kb.audit_df()
+    assert {"Submitted answer for approval", "Edited and approved SME answer"} <= set(log["action"])
+    assert "Priya" in set(log["actor"]) and "Admin" in set(log["actor"])
+    # reject: never used, question back to the SME Desk with the reason
+    kb.ask("NORAM", "what is the cut off for group seat release", "a5")
+    g2 = [g for g in kb.sme_queue("NORAM") if "group seat release" in g["question"]][0]
+    kb.sme_answer(g2["ids"], "NORAM", "Group seat release cut off", "Seven days.", "Ravi")
+    with pytest.raises(ValueError):
+        kb.approve_answer(999, "Admin")
+    kb.reject_answer(kb.pending_answers("NORAM")[0]["id"], "Admin", "Wrong - it is 21 days, check the group SOP")
+    back = [g for g in kb.sme_queue("NORAM") if "group seat release" in g["question"]][0]
+    assert any("rejected by admin" in x.lower() for x in back["reasons"])
+    assert "Rejected SME answer" in set(kb.audit_df()["action"])
+    assert len(kb.audit_excel(kb.audit_df())) > 1000
+    # an SME edit of an answer in use: the old answer stays until approved
+    lid = kb.teach("NORAM", "VIP desk phone", "Call extension 100.", "Admin")
+    kb.teach("NORAM", "VIP desk phone", "Call extension 200.", "Priya", approved=False, role="sme", replaces=lid)
+    assert "100" in kb.ask("NORAM", "VIP desk phone", "a6")["answer"]
+    kb.approve_answer(kb.pending_answers("NORAM")[0]["id"], "Admin")
+    assert "200" in kb.ask("NORAM", "VIP desk phone", "a7")["answer"]
+    assert not kb.pending_answers()
+
+
+def test_reply_to_agent_only_does_not_change_vidya():
+    r = kb.ask("NORAM", "obt login issue", "Amit")
+    g = [g for g in kb.sme_queue("NORAM") if g["question"] == "obt login issue"][0]
+    kb.reply_to_agent(g["ids"], "For this traveller only: use the backup login link sent by e-mail.", "Priya")
+    h = [x for x in kb.history("NORAM", "Amit") if x["id"] == r["id"]][0]
+    assert "backup login link" in h["sme_reply"] and h["sme_reply_by"] == "Priya"
+    assert not kb.pending_answers() and not kb.list_learned("NORAM")                # memory unchanged
+    assert not [x for x in kb.sme_queue("NORAM") if x["question"] == "obt login issue"]
+    assert "Replied to agent only (not added to Vidya)" in set(kb.audit_df()["action"])
+    with pytest.raises(ValueError):
+        kb.reply_to_agent(g["ids"], "  ", "Priya")
+
+
+def test_votes_rule_answer_also_waits_for_admin():
+    r = _voted_question()
+    for n in range(10):
+        kb.give_feedback(r["id"], True, voter=f"agent{n}", role="agent")
+    kb.sme_vote(r["id"], "sme1", True)
+    kb.sme_vote(r["id"], "sme2", True)
+    p = [x for x in kb.pending_answers("APAC") if x["source"] == "auto"]
+    assert len(p) == 1
+    with kb._conn() as con:
+        assert con.execute("SELECT active FROM learned WHERE id=?", (p[0]["id"],)).fetchone()[0] == 0
+    kb.approve_answer(p[0]["id"], "Admin")
+    with kb._conn() as con:
+        assert con.execute("SELECT active FROM learned WHERE id=?", (p[0]["id"],)).fetchone()[0] == 1

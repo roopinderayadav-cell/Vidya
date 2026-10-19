@@ -1,9 +1,25 @@
-# Vidya v5.3 - Your AI Learning & Knowledge Assistant (NORAM · EUROPE · APAC)
+# Vidya v5.4 - Your AI Learning & Knowledge Assistant (NORAM · EUROPE · APAC)
 
 Vidya is the team's AI knowledge assistant (formerly iKnow / OpsMate). Agents ask questions in
 plain words (typos and Hindi/Kannada/Telugu in English letters are fine) or paste a screenshot,
 and get one short answer with its SOP source and a confidence level. When Vidya is not sure it
 says: "I do not have answer to this question, please consult with your team supervisor."
+
+## What's new in Vidya v5.4 - admin approval of SME answers, approval log, SME dashboard
+- **Nothing an SME writes reaches Vidya's memory until an admin approves it:** new SME answers, "Vidya's answer
+  is right", answers saved from live chat, SME edits of existing answers (the old answer stays in use until the
+  change is approved) and answers learned from 👍 votes (10 agents + 2 SMEs + 80%).
+- **SME Desk - the SME chooses:** 📨 *Reply to agent only* (the agent sees it at once in My Questions; Vidya's
+  memory unchanged) · ✅ *Reply + add to Vidya* (agent sees it now; memory after admin approval) · 📝 *Reply +
+  SOP update needed* (agent sees it now; goes to Admin → Knowledge Gaps). Tab **📨 Sent for approval** shows
+  what happened to each submission.
+- **Admin → Approve SME answers:** approve as written, edit then approve, or reject with a reason (the question
+  goes back to the SME Desk with the reason). SMEs can switch an answer off; only an admin switches it on.
+- **Admin → Approval log:** who submitted, who approved / edited / rejected (with before and after text), plus
+  documents uploaded or deleted, answers switched on or off, SME votes and replies. Filters and Excel download.
+- **SME → Dashboard:** SMEs now see the dashboard and the questions & feedback report.
+- Fixes: status-code questions ("segment shows HX what to do") are answered; a repeated AI notice shows once;
+  an approved edit is used at once even when the new text has the same length.
 
 ## What's new in Vidya v5.3 - GDS question, stricter learning, feedback report
 - **"Which GDS?" every time:** a GDS question (commands, entries, PNR, TST, void, reissue, exchange, ...)

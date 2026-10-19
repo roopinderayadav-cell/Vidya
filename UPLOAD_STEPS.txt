@@ -1,14 +1,14 @@
-Vidya v5.3 - upload steps (only changed files)
+Vidya v5.4 - upload steps (only changed files; includes everything from v5.3)
 
 1. Open your Vidya repository on GitHub -> Add file -> Upload files.
-2. Drag in these 7 files (they replace the old ones in the main folder):
-   app.py, admin_pages.py, knowledge.py, config.py, test_vidya.py, README.md, ui.py
-   (ui.py is the image fix sent earlier - same file; upload it again if you are not sure)
-3. Commit message:  Vidya v5.3 - always ask GDS, 10+2 votes and 80% learning rule, feedback report
+2. Drag in these 8 files (they replace the old ones in the main folder):
+   app.py, admin_pages.py, knowledge.py, brain.py, config.py, test_vidya.py, README.md, ui.py
+3. Commit message:  Vidya v5.4 - admin approval of SME answers, approval log, SME dashboard
 4. Nothing to delete. No change to Secrets, requirements.txt or packages.txt.
-5. Streamlit restarts the app by itself (if not: Manage app -> Reboot).
+5. Streamlit restarts by itself (if not: Manage app -> Reboot).
 
-First start after the update (automatic, one time):
-- Older 👍/👎 votes are linked to the person who asked.
-- Answers auto-learned under the old rule (2 👍) are switched off, not deleted:
-  Admin -> Learned Answers -> Auto-learned. Switch one back on there if you are sure it is right.
+After the update:
+- Admin menu: "Approve SME answers (n)" and "Approval log".
+- SME menu: "Dashboard"; SME Desk has "Reply to agent only" and the tab "Sent for approval".
+- Answers SMEs saved BEFORE this update stay in use (they were already live). From now on every SME answer waits for an admin.
+- Download a backup first (Settings -> Backup) - always a good habit before an update.

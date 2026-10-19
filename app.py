@@ -265,7 +265,7 @@ def render_answer(msg, i):
     elif meta.get("did_you_mean"):
         bits.append("🔤 understood as *" + meta["did_you_mean"].replace("*", STAR) + "*")
     st.caption(" · ".join(bits), help=CONF_HELP if result == "answered" else None)
-    for note in meta.get("notes", []):
+    for note in dict.fromkeys(meta.get("notes", [])):      # the same notice once, not once per AI try
         st.caption(f"ℹ️ {note}")
     if msg.get("qid") and (result in ("not_found", "conflict") or meta.get("sme_review")):
         online = len(kb.smes_online(region))
@@ -540,11 +540,14 @@ def page_my_questions():
         st.info("You haven't asked anything in this region yet.")
     for r in rows:
         result = r.get("result") or ("answered" if r["status"] in ("answered", "resolved") else "not_found")
-        label = {"answered": "✅", "not_found": "⏳", "conflict": "⚠️"}.get(result, "")
+        label = "🧑‍🏫" if r.get("sme_reply") else {"answered": "✅", "not_found": "⏳", "conflict": "⚠️"}.get(result, "")
         with st.expander(f"{label} {r['asked_at']} · {r['question']}"):
             st.markdown(ui.result_badge(result), unsafe_allow_html=True)
             st.markdown(r["answer"] or "")
-            if r["status"] == "resolved":
+            if r.get("sme_reply"):
+                st.info(f"🧑‍🏫 **Answer from SME {r.get('sme_reply_by') or ''}** ({r.get('sme_reply_at') or ''}):\n\n"
+                        + privacy.mask_md(r["sme_reply"]))
+            elif r["status"] == "resolved":
                 st.success("The process team has added an answer - ask again to see it.")
 
 
@@ -639,10 +642,15 @@ if ss.is_sme or ss.is_admin:
     n_sme = len(kb.sme_queue()) + len(kb.waiting_chats())
     SME_PAGE = _page(_admin(admin_pages.sme_desk), f"SME Desk ({n_sme})", "🧑‍🏫", "sme-desk")
     sections["SME"] = [SME_PAGE]
+    if not ss.is_admin:                     # SMEs see the dashboard too (admins have it under Admin)
+        sections["SME"].append(_page(_admin(admin_pages.dashboard), "Dashboard", "📊", "sme-dashboard"))
 if ss.is_admin:
     n_review, n_gaps = len(kb.review_queue()), len(kb.knowledge_gaps())
+    n_appr = len(kb.pending_answers())
     sections["Admin"] = [
         _page(_admin(admin_pages.dashboard), "Dashboard", "📊", "dashboard"),
+        _page(_admin(admin_pages.approvals), f"Approve SME answers ({n_appr})", "✅", "approvals"),
+        _page(_admin(admin_pages.approval_log), "Approval log", "📜", "approval-log"),
         _page(_admin(admin_pages.documents), "Document Management", "🗂️", "documents"),
         _page(_admin(admin_pages.review), f"Review Queue ({n_review})", "🧠", "review"),
         _page(_admin(admin_pages.gaps), f"Knowledge Gaps ({n_gaps})", "🕳️", "gaps"),

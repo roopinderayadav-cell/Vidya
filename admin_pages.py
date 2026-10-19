@@ -272,7 +272,7 @@ def documents(region, user):
             kb.set_document_status(d["id"], "Archived" if status == "Active" else "Active")
             st.rerun()
         if a3.button("🗑", key=f"x{d['id']}", help="Delete"):
-            kb.delete_document(d["id"])
+            kb.delete_document(d["id"], actor=user)
             st.rerun()
     if not docs:
         st.info("No documents match.")
@@ -344,9 +344,12 @@ def sme_desk(region, user):
                "Write the correct answer once - Vidya uses it for this and similar questions from then on. "
                "Uploaded SOPs and documents are not changed.")
     n_wait, n_rev = len(kb.waiting_chats()), len(kb.chats_to_review(sme=user))
-    t1, tc, t2, tv, th = st.tabs(["⏳ Waiting for an SME", f"💬 Live chat ({n_wait} waiting"
-                                  + (f", {n_rev} to save" if n_rev else "") + ")",
-                                  "✅ Answers given by SMEs", "👍 Answers to confirm", "🗂️ Chat history"])
+    t1, tc, t2, tv, ts, th = st.tabs(["⏳ Waiting for an SME", f"💬 Live chat ({n_wait} waiting"
+                                      + (f", {n_rev} to save" if n_rev else "") + ")",
+                                      "✅ Answers given by SMEs", "👍 Answers to confirm", "📨 Sent for approval",
+                                      "🗂️ Chat history"])
+    with ts:
+        _sme_submissions(region, user)
     with tv:
         _sme_confirm(region, user)
     with tc:
@@ -410,6 +413,105 @@ def _sme_confirm(region, user):
                 st.rerun()
 
 
+def _sme_submissions(region, user):
+    """What this SME sent to the admin and what happened to it."""
+    st.caption("Every SME answer or change waits for an admin. Vidya uses it only after approval.")
+    mine = st.toggle("Only mine", value=not _is_admin(), key="subs_mine")
+    rows = kb.sme_submissions(user if mine else None, None)
+    if not rows:
+        st.info("Nothing sent for approval yet.")
+    icon = {"pending": "⏳ waiting for admin", "approved": "✅ approved", "merged": "✅ approved (edit applied)",
+            "rejected": "❌ rejected"}
+    for r in rows[:50]:
+        with st.container(border=True):
+            st.markdown(f"{icon.get(r['status'], r['status'])} · {ui.region_pill(r['region'])} **Q:** {ui.esc(r['question'])}",
+                        unsafe_allow_html=True)
+            st.markdown(privacy.mask_md(r["answer"]))
+            st.caption(f"sent by {r['added_by']} · {r['added_at']}"
+                       + (f" · reviewed by {r['approved_by']} · {r['approved_at']}" if r.get("approved_by") and r["status"] != "pending" else "")
+                       + (f" · note: {r['review_note']}" if r.get("review_note") else ""))
+
+
+# ---------------------------------------------------------------------------
+# ADMIN: approve SME answers (approve as written, edit then approve, or reject)
+# ---------------------------------------------------------------------------
+def approvals(region, user):
+    st.header("✅ Approve SME answers")
+    st.caption("SME answers, SME edits and answers learned from 👍 votes wait here. Vidya does not use them until "
+               "you approve. Edit the text before approving if needed; a rejected answer goes back to the SME Desk "
+               "with your reason.")
+    lob = st.selectbox("LOB", ["All"] + config.REGIONS + [config.GLOBAL_REGION], key="appr_lob")
+    rows = kb.pending_answers(lob)
+    if not rows:
+        st.success("Nothing waiting for approval. 🎉")
+        return
+    st.caption(f"{len(rows)} waiting.")
+    for r in rows:
+        with st.container(border=True):
+            kind = ("✏ Change to an existing answer" if r.get("replaces") else
+                    "🧠 Learned from 👍 votes" if r.get("source") == "auto" else "🧑‍🏫 New SME answer")
+            st.markdown(f"**{kind}** · {ui.region_pill(r['region'])} · sent by **{ui.esc(r['added_by'])}** · {r['added_at']}",
+                        unsafe_allow_html=True)
+            if r.get("asked"):
+                st.caption(f"Agent question: {r['asked']['question']} (asked by {r['asked']['asked_by']})")
+            if r.get("old"):
+                with st.expander("Current answer (in use until you approve the change)"):
+                    st.markdown(f"**Q:** {ui.esc(r['old']['question'])}")
+                    st.markdown(privacy.mask_md(r["old"]["answer"]))
+            with st.form(f"appr{r['id']}"):
+                q = st.text_input("Question", r["question"])
+                a = st.text_area("Answer (edit if needed)", r["answer"], height=150)
+                note = st.text_input("Note / reason (needed to reject)")
+                b1, b2, b3 = st.columns(3)
+                try:
+                    if b1.form_submit_button("✅ Approve", type="primary", width="stretch"):
+                        kb.approve_answer(r["id"], user, q, a, note.strip())
+                        st.toast("Approved - Vidya uses it from now on.", icon="✅")
+                        st.rerun()
+                    if b2.form_submit_button("❌ Reject", width="stretch"):
+                        if not note.strip():
+                            st.warning("Please write the reason - the SME will see it.")
+                        else:
+                            kb.reject_answer(r["id"], user, note.strip())
+                            st.toast("Rejected - sent back to the SME Desk.", icon="❌")
+                            st.rerun()
+                except ValueError as e:
+                    st.warning(str(e))
+                b3.caption("Approving after editing saves your version and logs both.")
+
+
+def approval_log(region, user):
+    st.header("📜 Approval log")
+    st.caption("Who submitted, who approved, edited or rejected, and every other change to the knowledge base "
+               "(documents uploaded or deleted, answers switched on or off, SME votes).")
+    c1, c2, c3, c4, c5 = st.columns([1, 1, 1.4, 1.4, 1.3])
+    period = c1.selectbox("Period", list(PERIODS), index=1, key="log_period")
+    lob = c2.selectbox("LOB", ["All"] + config.REGIONS + [config.GLOBAL_REGION], key="log_lob")
+    action = c3.selectbox("Action", ["All", "Submitted", "Approved", "Edited", "Rejected", "Uploaded", "Deleted",
+                                     "Switched", "SME vote", "Flagged", "Dismissed", "Reached the 👍 rule"], key="log_act")
+    person = c4.text_input("Person (name contains)", key="log_who")
+    df = kb.audit_df(PERIODS[period], lob, action, person)
+    c5.write("")
+    c5.download_button("⬇ Download log (Excel)", kb.audit_excel(df), type="primary", width="stretch",
+                       file_name=f"Vidya_approval_log_{datetime.now():%Y-%m-%d}.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    if df.empty:
+        st.info("No entries for this filter.")
+        return
+    k = st.columns(4)
+    ui.kpi(k[0], "📨", int(df["action"].str.startswith("Submitted").sum()), "Submitted by SMEs")
+    ui.kpi(k[1], "✅", int(df["action"].str.contains("pproved").sum()), "Approved")
+    ui.kpi(k[2], "✏", int(df["action"].str.startswith("Edited").sum()), "Edited by admin")
+    ui.kpi(k[3], "❌", int(df["action"].str.startswith("Rejected").sum()), "Rejected")
+    st.dataframe(df[["at", "actor", "role", "action", "region", "item", "question", "details"]].rename(columns={
+        "at": "When", "actor": "Who", "role": "Role", "action": "What", "region": "LOB", "item": "Item",
+        "question": "Question", "details": "Details"}), hide_index=True, width="stretch")
+
+
+def _is_admin():
+    return bool(st.session_state.get("is_admin"))
+
+
 def _sme_card(n, g, user):
     q = g["latest"]
     with st.container(border=True):
@@ -439,21 +541,33 @@ def _sme_card(n, g, user):
             ans = st.text_area("SME answer", height=140,
                                placeholder="Write the steps / rule exactly as agents should follow them. "
                                            "Numbered steps work best: 1. ... 2. ...")
-            b = st.columns(4)
-            save = b[0].form_submit_button("✅ Save SME answer", type="primary")
-            ok = b[1].form_submit_button("👍 Vidya's answer is right", disabled=not bot_answered)
-            sop = b[2].form_submit_button("📝 SOP update needed")
-            drop = b[3].form_submit_button("🚫 Not a process question")
+            st.caption("The agent who asked sees your answer at once (My Questions). It goes into Vidya's memory "
+                       "only if you choose so and " + ("you save it." if _is_admin() else "an admin approves it."))
+            b = st.columns(5)
+            reply = b[0].form_submit_button("📨 Reply to agent only", type="primary")
+            save = b[1].form_submit_button("✅ Reply + add to Vidya" + ("" if _is_admin() else " (needs approval)"))
+            ok = b[2].form_submit_button("👍 Vidya's answer is right", disabled=not bot_answered)
+            sop = b[3].form_submit_button("📝 Reply + SOP update needed")
+            drop = b[4].form_submit_button("🚫 Not a process question")
             try:
+                if reply:
+                    kb.reply_to_agent(g["ids"], ans, user)
+                    st.toast("Sent to the agent. Vidya's memory is not changed.", icon="📨")
+                    st.rerun()
                 if save:
-                    kb.sme_answer(g["ids"], g["region"], new_q, ans, user)
-                    st.toast("Saved - Vidya will use this answer next time.", icon="✅")
+                    kb.reply_to_agent(g["ids"], ans, user, memory=True)
+                    kb.sme_answer(g["ids"], g["region"], new_q, ans, user, approved=_is_admin())
+                    st.toast("Saved - Vidya uses it from now on." if _is_admin() else
+                             "Sent to an admin for approval - Vidya uses it once approved.", icon="✅")
                     st.rerun()
                 if ok:
-                    kb.sme_confirm(g["ids"], user)
-                    st.toast("Confirmed - kept as a verified answer.", icon="👍")
+                    kb.sme_confirm(g["ids"], user, approved=_is_admin())
+                    st.toast("Confirmed - kept as a verified answer." if _is_admin() else
+                             "Sent to an admin for approval.", icon="👍")
                     st.rerun()
                 if sop:
+                    if ans.strip():
+                        kb.reply_to_agent(g["ids"], ans, user, memory=True)
                     kb.sme_flag_sop(g["ids"], user, ans.strip())
                     st.toast("Sent to Admin → Knowledge Gaps as 'SOP update needed'.", icon="📝")
                     st.rerun()
@@ -628,8 +742,9 @@ def _sme_live(region, user):
                         chosen.append({"question": q, "answer": a, "asked": p["asked"]})
                 b1, b2 = st.columns(2)
                 if b1.form_submit_button("💾 Save ticked answers", type="primary"):
-                    n = kb.save_chat_pairs(c["id"], chosen, user)
-                    st.toast(f"Saved {n} answer(s) - Vidya will use them next time.", icon="✅")
+                    n = kb.save_chat_pairs(c["id"], chosen, user, approved=_is_admin())
+                    st.toast(f"Saved {n} answer(s) - Vidya uses them from now on." if _is_admin() else
+                             f"Sent {n} answer(s) to an admin for approval.", icon="✅")
                     st.rerun()
                 if b2.form_submit_button("Nothing to save"):
                     kb.save_chat_pairs(c["id"], [], user)
@@ -674,15 +789,24 @@ def _sme_answers(region, user):
                     nq = st.text_input("Question", r["question"])
                     na = st.text_area("Answer", r["answer"], height=120)
                     c1, c2 = st.columns(2)
-                    if c1.form_submit_button("Save changes", type="primary"):
+                    if c1.form_submit_button("Save changes" if _is_admin() else "Send change for approval",
+                                             type="primary"):
                         try:
-                            kb.update_learned(r["id"], nq, na, user)
+                            if _is_admin():
+                                kb.update_learned(r["id"], nq, na, user)
+                                kb.log(user, "admin", "Edited answer", r["region"], f"answer #{r['id']}", nq,
+                                       f"Before: {r['answer']} | After: {na}")
+                            else:                    # the old answer stays in use until an admin approves
+                                kb.teach(r["region"], nq, na, user, approved=False, role="sme", replaces=r["id"])
+                                st.toast("Sent to an admin for approval.", icon="✅")
                             st.rerun()
                         except ValueError as e:
                             st.warning(str(e))
-                    if c2.form_submit_button("Switch off" if r.get("active", 1) else "Switch on"):
-                        kb.set_learned(r["id"], active=not r.get("active", 1))
-                        st.rerun()
+                    if r.get("active", 1) or _is_admin():     # SMEs can switch off; only an admin switches on
+                        if c2.form_submit_button("Switch off" if r.get("active", 1) else "Switch on"):
+                            kb.set_learned(r["id"], active=not r.get("active", 1), admin=user,
+                                           role="admin" if _is_admin() else "sme")
+                            st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -758,7 +882,8 @@ def learned(region, user):
                "answer is switched off again automatically. Below the rule, votes change nothing.")
     t1, t2, t3 = st.tabs(["✅ Verified", "🧠 Auto-learned (staff 👍)", "➕ Add a Q&A"])
     with t1:
-        rows = kb.list_learned(region, "verified") + kb.list_learned(config.GLOBAL_REGION, "verified")
+        rows = [r for r in kb.list_learned(region, "verified") + kb.list_learned(config.GLOBAL_REGION, "verified")
+                if (r.get("status") or "approved") == "approved"]
         if not rows:
             st.info("No verified answers yet for this region.")
         for l in rows:
@@ -768,10 +893,10 @@ def learned(region, user):
                 a.markdown(f"**A:** {l['answer']}")
                 a.caption(f"by {l['added_by']} · {l['added_at']}")
                 if b.button("Delete", key=f"dv{l['id']}"):
-                    kb.set_learned(l["id"], delete=True)
+                    kb.set_learned(l["id"], delete=True, admin=user)
                     st.rerun()
     with t2:
-        rows = kb.list_learned(region, "auto")
+        rows = [r for r in kb.list_learned(region, "auto") if (r.get("status") or "approved") == "approved"]
         if not rows:
             st.info("Nothing auto-learned yet. Answers staff mark 👍 appear here.")
         for l in rows:
@@ -784,10 +909,10 @@ def learned(region, user):
                     kb.set_learned(l["id"], make_verified=True, admin=user)
                     st.rerun()
                 if b.button("Switch off" if l["active"] else "Switch on", key=f"ta{l['id']}"):
-                    kb.set_learned(l["id"], active=not l["active"])
+                    kb.set_learned(l["id"], active=not l["active"], admin=user)
                     st.rerun()
                 if b.button("Delete", key=f"da{l['id']}"):
-                    kb.set_learned(l["id"], delete=True)
+                    kb.set_learned(l["id"], delete=True, admin=user)
                     st.rerun()
     with t3:
         with st.form("add_qa", clear_on_submit=True):

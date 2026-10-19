@@ -122,6 +122,13 @@ def init_db():
         _add_cols(con, "feedback_pairs", [("voter", "TEXT"), ("role", "TEXT DEFAULT 'agent'"),
                                           ("qid", "INTEGER")])
         _add_cols(con, "learned", [("gds", "TEXT DEFAULT ''"), ("source_key", "TEXT DEFAULT ''")])
+        # v5.4: SME answers wait for an admin (approve / edit / reject); every step is logged
+        _add_cols(con, "learned", [("status", "TEXT DEFAULT 'approved'"), ("approved_by", "TEXT"),
+                                   ("approved_at", "TEXT"), ("review_note", "TEXT"), ("replaces", "INTEGER")])
+        _add_cols(con, "questions", [("sme_reply", "TEXT"), ("sme_reply_by", "TEXT"), ("sme_reply_at", "TEXT")])
+        con.execute("""CREATE TABLE IF NOT EXISTS audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT, actor TEXT, role TEXT, action TEXT,
+            region TEXT, item TEXT, question TEXT, details TEXT)""")
         done = con.execute("SELECT value FROM app_settings WHERE key='learn_rule_v53'").fetchone()
         if not done:
             # older votes: the person is the one who asked (only they could rate their own answer then)
@@ -522,6 +529,7 @@ def add_document(region, doc_type, title, filename, data: bytes, uploaded_by, ve
         con.execute("UPDATE documents SET chunks=? WHERE id=?", (len(pieces), doc_id))
     stored_images = store_images(doc_id, images)
     rechecked = recheck_gaps(region, doc_title=title or filename)
+    log(uploaded_by, "admin", "Uploaded document", region, f"document #{doc_id}", "", f"{title} ({filename})")
     return doc_id, len(pieces), {"images_found": len(images), "images_read": len(image_parts),
                                  "images_stored": stored_images,
                                  "images_skipped": skipped, "semantic": semantic,
@@ -756,9 +764,13 @@ def answer_images(hits, limit=None):
     return out
 
 
-def delete_document(doc_id):
+def delete_document(doc_id, actor=""):
     with _conn() as con:
         row = con.execute("SELECT stored_path FROM documents WHERE id=?", (doc_id,)).fetchone()
+        d = con.execute("SELECT region, title FROM documents WHERE id=?", (doc_id,)).fetchone()
+    if d and actor:
+        log(actor, "admin", "Deleted document", d["region"], f"document #{doc_id}", "", d["title"])
+    with _conn() as con:
         con.execute("DELETE FROM chunks WHERE doc_id=?", (doc_id,))
         con.execute("DELETE FROM documents WHERE id=?", (doc_id,))
     _delete_images(doc_id)
@@ -903,7 +915,15 @@ def _library_signature():
             " (SELECT COUNT(*) || ':' || COALESCE(MAX(id), 0) || ':' || COALESCE(SUM(LENGTH(question) + LENGTH(answer)"
             " + LENGTH(COALESCE(variants, '')) + COALESCE(active, 1) * 7 + LENGTH(COALESCE(region, ''))"
             " + LENGTH(COALESCE(source, '')) + LENGTH(COALESCE(embedding, '')) + LENGTH(COALESCE(gds, ''))), 0)"
-            " FROM learned)").fetchone())
+            " FROM learned),"
+            " (SELECT value FROM app_settings WHERE key='kb_version')").fetchone())
+
+
+def _bump():
+    """Any change to answers (approve, edit, switch on/off) refreshes the search index."""
+    with _conn() as con:
+        con.execute("INSERT INTO app_settings (key, value) VALUES ('kb_version', '1') ON CONFLICT(key) DO UPDATE "
+                    "SET value = CAST(value AS INTEGER) + 1")
 
 
 def _cached(region, all_regions):
@@ -1306,7 +1326,9 @@ def _combine_parts(subs):
 
 
 _GENERIC = set("""today tomorrow yesterday after before first second third right wrong again still other
-always never every where which there their about should could would might people things thing""".split())
+always never every where which there their about should could would might people things thing
+shows showing showed displays displayed appears appearing getting coming comes happens happened happening
+saying means meaning please explain tell""".split())      # filler words: "segment shows HX" -> the term is HX
 
 
 def faq_question_cover(region, question_core, hit):
@@ -1564,7 +1586,7 @@ def gds_words_in(text):
 
 _MEANING_Q = re.compile(r"(?i)^\s*(what\s+(is|are|does)\b.*\b(mean|meaning|stand\s+for)\b|what\s+(is|are)\s+(an?\s+|the\s+)?"
                         r"[\w/&.\-]+(\s+(and|or)\s+[\w/&.\-]+)?\s*\??\s*$|(full\s+form|meaning|define|definition)\b"
-                        r"|.*\b(full\s+form|stands?\s+for|meaning\s+of)\b)")
+                        r"|.*\b(full\s+form|stands?\s+for|meaning)\b)")
 
 
 def _is_meaning_question(text):
@@ -1814,13 +1836,21 @@ def ask(region, question, asked_by, image=None, sub_lob=None, clarify=True, _par
         if used and "reranker" not in meta["layers"]:
             meta["layers"].append("reranker")
         st = brain.core_text(fixed)
+        # after "Which GDS?" the question ends "... in Sabre": a passage that is the same in every GDS
+        # (status codes, fare rules) must not lose points for not saying "Sabre"
+        st_any = (re.sub(rf"(?i)\b(in |for |on )?({'|'.join(config.CLARIFY_GROUPS.get('GDS', []))})\b", " ", st)
+                  if gds else st)
+
+        def _cov(h):
+            text = h.get("search", h["text"])
+            return brain.coverage(st if (not gds or _variant(h, config.CLARIFY_GROUPS.get("GDS", []))) else st_any, text)
         # re-rank the leaders: a passage that covers more of the question's key words wins
         for h in hits[:5]:
-            h["cover"] = brain.coverage(st, h.get("search", h["text"]))
+            h["cover"] = _cov(h)
             h["score"] = h["score"] * (0.6 + 0.4 * h["cover"])
         hits = sorted(hits[:5], key=lambda x: x["score"], reverse=True) + hits[5:]
         best = hits[0] if hits else None
-        cover = brain.coverage(st, best.get("search", best["text"])) if best else 0
+        cover = _cov(best) if best else 0
         conf = brain.offline_confidence(best["lex"], cover, best["sem"], len(brain.content_words(st))) if best else "low"
         if best and best["kind"] == "learned":   # short, curated answers: trust a strong match
             if conf == "medium" or (conf == "low" and best["lex"] >= 0.25 and cover >= 0.5):
@@ -2149,16 +2179,19 @@ def _relearn(q, question, key):
         return
     t = vote_status(q["region"], question, key)
     with _conn() as con:
-        mine = con.execute("SELECT id, active FROM learned WHERE region=? AND source='auto' AND source_key=?",
+        mine = con.execute("SELECT id, active, status FROM learned WHERE region=? AND source='auto' AND source_key=?",
                            (q["region"], key)).fetchall()
         if not t["approved"]:
             for r in mine:                 # an answer that no longer meets the rule is switched off
                 if r["active"]:
                     con.execute("UPDATE learned SET active=0 WHERE id=?", (r["id"],))
+                if r["status"] == "pending":   # ...and leaves the admin's approval queue
+                    con.execute("UPDATE learned SET status='withdrawn' WHERE id=?", (r["id"],))
             return
-        if mine:
-            con.execute("UPDATE learned SET active=1, votes=? WHERE region=? AND source='auto' AND source_key=?",
-                        (t["ups"], q["region"], key))
+        if mine:                           # back in use only if an admin approved it before
+            con.execute("UPDATE learned SET active=CASE WHEN COALESCE(status,'approved')='approved' THEN 1 ELSE 0 END,"
+                        " status=CASE WHEN status='withdrawn' THEN 'pending' ELSE status END,"
+                        " votes=? WHERE region=? AND source='auto' AND source_key=?", (t["ups"], q["region"], key))
             return
         if q["result"] != "answered" or not (q["answer"] or "").strip():
             return
@@ -2170,10 +2203,13 @@ def _relearn(q, question, key):
             pass
     gds = gds_named(question) or _one_gds(q["answer"]) or ""
     with _conn() as con:
-        con.execute("INSERT INTO learned (region, question, answer, added_by, added_at, from_question,"
-                    " source, active, votes, embedding, gds, source_key) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (q["region"], question, q["answer"], "Vidya (agents 👍 + SMEs 👍)", _now(), q["id"],
-                     "auto", 1, t["ups"], vec, gds, key))
+        cur = con.execute(
+            "INSERT INTO learned (region, question, answer, added_by, added_at, from_question, source, active, votes,"
+            " embedding, gds, source_key, status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (q["region"], question, q["answer"], "Vidya (agents 👍 + SMEs 👍)", _now(), q["id"],
+             "auto", 0, t["ups"], vec, gds, key, "pending"))      # an admin approves it before Vidya uses it
+    log("Vidya", "system", "Reached the 👍 rule - waiting for admin approval", q["region"],
+        f"answer #{cur.lastrowid}", question, f"agents {t['agents_up']}, SMEs {t['smes_up']}, {t['pct']}% positive")
 
 
 def sme_vote(qid, sme, helpful=True):
@@ -2182,6 +2218,8 @@ def sme_vote(qid, sme, helpful=True):
         q = con.execute("SELECT * FROM questions WHERE id=?", (qid,)).fetchone()
     if q:
         _record_votes(q, helpful, sme, "sme")
+        log(sme, "sme", "SME vote 👍 correct" if helpful else "SME vote 👎 not correct", q["region"],
+            f"question #{qid}", q["question"], (q["answer"] or "")[:300])
 
 
 def answers_to_confirm(region=None, limit=40):
@@ -2226,8 +2264,21 @@ def review_queue(region=None):
         return [dict(r) for r in con.execute(q + " ORDER BY id DESC", args)]
 
 
-def teach(region, question, answer, admin, from_question=None, variants=None):
-    """Store a VERIFIED answer (written by the process team / an SME). Used first from now on.
+def log(actor, role, action, region="", item="", question="", details=""):
+    """Approval / change log (Admin → Approval log). Card numbers are masked."""
+    _bump()
+    with _conn() as con:
+        con.execute("INSERT INTO audit_log (at, actor, role, action, region, item, question, details) "
+                    "VALUES (?,?,?,?,?,?,?,?)", (_now(), actor or "", role or "", action, region or "", item or "",
+                                                 privacy.mask(question or "")[:500], privacy.mask(details or "")[:2000]))
+
+
+def teach(region, question, answer, admin, from_question=None, variants=None, approved=True, role="admin",
+          replaces=None):
+    """Store a VERIFIED answer (written by the process team / an SME).
+    approved=True (an admin wrote it): used first from now on.
+    approved=False (an SME wrote it): waits in Admin → Approve SME answers; Vidya does not use it until an
+    admin approves it (as written or edited). replaces = id of the answer an SME edit would replace.
     variants = the wordings agents actually typed, so the same words find this answer again."""
     question, answer = privacy.mask(question), privacy.mask(answer)
     variants = [privacy.mask(v) for v in (variants or [])]
@@ -2241,12 +2292,130 @@ def teach(region, question, answer, admin, from_question=None, variants=None):
             pass
     with _conn() as con:
         gds = gds_named(question) or _one_gds(answer) or ""      # an SME answer for one GDS stays with it
-        con.execute("INSERT INTO learned (region, question, answer, added_by, added_at, from_question,"
-                    " source, active, votes, embedding, variants, gds) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (region, question, answer, admin, _now(), from_question, "verified", 1, 0, vec, vtext, gds))
+        cur = con.execute(
+            "INSERT INTO learned (region, question, answer, added_by, added_at, from_question, source, active, votes,"
+            " embedding, variants, gds, status, approved_by, approved_at, replaces) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (region, question, answer, admin, _now(), from_question, "verified", 1 if approved else 0, 0, vec, vtext,
+             gds, "approved" if approved else "pending", admin if approved else None, _now() if approved else None,
+             replaces))
+        lid = cur.lastrowid
         if from_question:
-            con.execute("UPDATE questions SET status='resolved', gap_status='Fixed' WHERE id=?",
-                        (from_question,))
+            con.execute("UPDATE questions SET status=?, gap_status=? WHERE id=?",
+                        ("resolved", "Fixed", from_question) if approved else
+                        ("pending_approval", "In progress", from_question))
+    what = "edit of answer #%s" % replaces if replaces else "answer"
+    if approved:
+        log(admin, role, "Added and approved " + what, region, f"answer #{lid}", question, answer)
+    else:
+        log(admin, role, "Submitted " + what + " for approval", region, f"answer #{lid}", question, answer)
+    return lid
+
+
+def pending_answers(region=None):
+    """SME answers and SME edits waiting for an admin."""
+    q, args = "SELECT * FROM learned WHERE status='pending'", []
+    if region and region != "All":
+        q += " AND region=?"; args.append(region)
+    with _conn() as con:
+        rows = [dict(r) for r in con.execute(q + " ORDER BY id", args)]
+        for r in rows:
+            r["old"] = None
+            if r.get("replaces"):
+                o = con.execute("SELECT question, answer FROM learned WHERE id=?", (r["replaces"],)).fetchone()
+                r["old"] = dict(o) if o else None
+            r["asked"] = None
+            if r.get("from_question"):
+                o = con.execute("SELECT question, asked_by, answer FROM questions WHERE id=?",
+                                (r["from_question"],)).fetchone()
+                r["asked"] = dict(o) if o else None
+    return rows
+
+
+def approve_answer(lid, admin, question=None, answer=None, note=""):
+    """Admin approves an SME answer - as written, or after editing it. From now on Vidya uses it."""
+    with _conn() as con:
+        r = con.execute("SELECT * FROM learned WHERE id=? AND status='pending'", (lid,)).fetchone()
+    if not r:
+        raise ValueError("This answer is no longer waiting for approval.")
+    q2 = privacy.mask((question if question is not None else r["question"]).strip())
+    a2 = privacy.mask((answer if answer is not None else r["answer"]).strip())
+    if not q2 or not a2:
+        raise ValueError("Question and answer can't be empty.")
+    edited = (q2 != r["question"]) or (a2 != r["answer"])
+    if r["replaces"]:                       # an SME edit of an existing answer: update that answer
+        update_learned(r["replaces"], q2, a2, r["added_by"])
+        with _conn() as con:
+            con.execute("UPDATE learned SET approved_by=?, approved_at=?, status='approved' WHERE id=?",
+                        (admin, _now(), r["replaces"]))
+            con.execute("UPDATE learned SET status='merged', active=0, approved_by=?, approved_at=?, review_note=?,"
+                        " question=?, answer=? WHERE id=?", (admin, _now(), note, q2, a2, lid))
+    else:
+        if edited:
+            update_learned(lid, q2, a2, r["added_by"])
+        with _conn() as con:
+            con.execute("UPDATE learned SET status='approved', active=1, approved_by=?, approved_at=?, review_note=?"
+                        " WHERE id=?", (admin, _now(), note, lid))
+    if r["from_question"]:
+        _close([r["from_question"]], r["added_by"], "resolved", "Fixed")
+    details = (f"Submitted by {r['added_by']}. " + (f"Admin edited the answer. Before: {r['answer']} | After: {a2}"
+                                                    if edited else f"Answer: {a2}") + (f" | Note: {note}" if note else ""))
+    log(admin, "admin", ("Edited and approved" if edited else "Approved") + (" edit of answer #%s" % r["replaces"]
+                                                                            if r["replaces"] else " SME answer"),
+        r["region"], f"answer #{r['replaces'] or lid}", q2, details)
+
+
+def reject_answer(lid, admin, reason=""):
+    """Admin rejects an SME answer: Vidya never uses it; the question goes back to the SME Desk with the reason."""
+    with _conn() as con:
+        r = con.execute("SELECT * FROM learned WHERE id=? AND status='pending'", (lid,)).fetchone()
+        if not r:
+            raise ValueError("This answer is no longer waiting for approval.")
+        con.execute("UPDATE learned SET status='rejected', active=0, approved_by=?, approved_at=?, review_note=?"
+                    " WHERE id=?", (admin, _now(), reason, lid))
+        if r["from_question"]:
+            con.execute("UPDATE questions SET status='needs_review', gap_status='Open', sme_reason=? WHERE id=?",
+                        (f"Answer rejected by admin: {reason}" if reason else "Answer rejected by admin",
+                         r["from_question"]))
+    log(admin, "admin", "Rejected SME answer", r["region"], f"answer #{lid}", r["question"],
+        f"Submitted by {r['added_by']}. Answer: {r['answer']}" + (f" | Reason: {reason}" if reason else ""))
+
+
+def audit_df(days=None, region=None, action=None, person=""):
+    import pandas as pd
+    q, args, where = "SELECT * FROM audit_log", [], []
+    if days:
+        where.append("at>=?"); args.append((datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M"))
+    if region and region != "All":
+        where.append("region=?"); args.append(region)
+    if action and action != "All":
+        where.append("action LIKE ?"); args.append(f"%{action}%")
+    if person.strip():
+        where.append("(lower(actor) LIKE ? OR lower(details) LIKE ?)")
+        args += [f"%{person.strip().lower()}%"] * 2
+    if where:
+        q += " WHERE " + " AND ".join(where)
+    with _conn() as con:
+        return pd.read_sql_query(q + " ORDER BY id DESC", con, params=args)
+
+
+def audit_excel(df):
+    import pandas as pd
+    from openpyxl.styles import Alignment, Font, PatternFill
+    cols = {"at": "When", "actor": "Who", "role": "Role", "action": "What", "region": "LOB", "item": "Item",
+            "question": "Question", "details": "Details"}
+    out = df[list(cols)].rename(columns=cols) if not df.empty else pd.DataFrame(columns=list(cols.values()))
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        out.to_excel(xw, sheet_name="Approval log", index=False)
+        ws = xw.book.worksheets[0]
+        for c in ws[1]:
+            c.font = Font(bold=True, color="FFFFFF"); c.fill = PatternFill("solid", fgColor="1F5FBF")
+        ws.freeze_panes = "A2"
+        for col, w in zip("ABCDEFGH", (17, 18, 8, 34, 9, 13, 50, 80)):
+            ws.column_dimensions[col].width = w
+            for c in ws[col][1:]:
+                c.alignment = Alignment(vertical="top", wrap_text=w >= 34)
+    return buf.getvalue()
 
 
 # ===========================================================================
@@ -2290,7 +2459,22 @@ def sme_queue(region=None):
     return sorted(groups.values(), key=lambda g: (g["count"], g["last"]), reverse=True)
 
 
-def sme_answer(ids, region, question, answer, sme):
+def reply_to_agent(ids, answer, sme, memory=False):
+    """The SME's answer goes straight to the agent(s) who asked (My Questions) - Vidya's memory is NOT changed.
+    memory=True only records that the SME also sent it for Vidya's memory (separate approval)."""
+    answer = privacy.mask((answer or "").strip())
+    if not ids or not answer:
+        raise ValueError("Please write the answer for the agent.")
+    marks = ",".join("?" * len(ids))
+    with _conn() as con:
+        con.execute(f"UPDATE questions SET sme_reply=?, sme_reply_by=?, sme_reply_at=? WHERE id IN ({marks})",
+                    [answer, sme, _now(), *ids])
+    if not memory:
+        _close(ids, sme, "answered_by_sme", "Closed")
+        _log_ids(ids, sme, "sme", "Replied to agent only (not added to Vidya)", answer)
+
+
+def sme_answer(ids, region, question, answer, sme, approved=False):
     """Save the SME's answer as a verified answer (searched first next time) and close the questions.
     Uploaded SOPs / documents are NOT changed."""
     question, answer = (question or "").strip(), (answer or "").strip()
@@ -2301,8 +2485,12 @@ def sme_answer(ids, region, question, answer, sme):
         with _conn() as con:
             asked = [re.sub(r"\s*\[screenshot\]$", "", r[0]) for r in con.execute(
                 f"SELECT question FROM questions WHERE id IN ({','.join('?' * len(ids))})", ids)]
-    teach(region, question, answer, sme, from_question=ids[0] if ids else None, variants=asked)
-    _close(ids, sme, "resolved", "Fixed")
+    teach(region, question, answer, sme, from_question=ids[0] if ids else None, variants=asked,
+          approved=approved, role="admin" if approved else "sme")
+    if approved:
+        _close(ids, sme, "resolved", "Fixed")
+    else:                                   # waits for an admin; out of the SME queue meanwhile
+        _close(ids, sme, "pending_approval", "In progress")
 
 
 def _close(ids, sme, status, gap):
@@ -2314,23 +2502,34 @@ def _close(ids, sme, status, gap):
                     f" sme_by=?, sme_at=? WHERE id IN ({marks})", [status, gap, sme, _now(), *ids])
 
 
-def sme_confirm(ids, sme):
+def sme_confirm(ids, sme, approved=False):
     """The SME checked Vidya's answer and it is right: keep it as a verified answer."""
     with _conn() as con:
         q = con.execute("SELECT * FROM questions WHERE id=?", (ids[0],)).fetchone()
     if not q or q["result"] != "answered":
         raise ValueError("There is no Vidya answer to confirm - please write the answer.")
-    sme_answer(ids, q["region"], re.sub(r"\s*\[screenshot\]$", "", q["question"]), q["answer"], sme)
+    sme_answer(ids, q["region"], re.sub(r"\s*\[screenshot\]$", "", q["question"]), q["answer"], sme, approved)
 
 
 def sme_flag_sop(ids, sme, note=""):
     """Needs a change in the SOP itself: goes to Admin → Knowledge Gaps."""
     set_gap(ids, status="SOP update needed", owner="", note=note or f"Flagged by SME {sme}")
     _close(ids, sme, "sop_update", "SOP update needed")
+    _log_ids(ids, sme, "sme", "Flagged: SOP update needed", note)
 
 
 def sme_dismiss(ids, sme):
     _close(ids, sme, "dismissed", "Closed")
+    _log_ids(ids, sme, "sme", "Dismissed question")
+
+
+def _log_ids(ids, actor, role, action, details=""):
+    if not ids:
+        return
+    with _conn() as con:
+        r = con.execute("SELECT region, question FROM questions WHERE id=?", (ids[0],)).fetchone()
+    if r:
+        log(actor, role, action, r["region"], f"question #{ids[0]}", r["question"], details)
 
 
 def update_learned(lid, question, answer, editor):
@@ -2346,11 +2545,23 @@ def update_learned(lid, question, answer, editor):
     with _conn() as con:   # the agents' wordings (variants) are kept
         con.execute("UPDATE learned SET question=?, answer=?, added_by=?, added_at=?, embedding=? WHERE id=?",
                     (question, answer, editor, _now(), vec, lid))
+    _bump()
 
 
 def sme_answers(region=None):
-    """Verified answers (written by SMEs / process team), newest first."""
-    return list_learned(region, "verified")
+    """Verified answers in use or switched off (not the ones waiting for / rejected by an admin), newest first."""
+    return [r for r in list_learned(region, "verified") if (r.get("status") or "approved") == "approved"]
+
+
+def sme_submissions(sme=None, region=None):
+    """What SMEs sent for approval and what happened to it (pending / approved / rejected)."""
+    q, args = "SELECT * FROM learned WHERE status IN ('pending','approved','rejected','merged') AND source='verified'", []
+    if sme:
+        q += " AND added_by=?"; args.append(sme)
+    if region and region != "All":
+        q += " AND region=?"; args.append(region)
+    with _conn() as con:
+        return [dict(r) for r in con.execute(q + " ORDER BY id DESC LIMIT 100", args)]
 
 
 # ===========================================================================
@@ -2511,7 +2722,7 @@ def chat_pairs(chat_id):
             for x, y in pairs if len(" ".join(y)) >= 15]
 
 
-def save_chat_pairs(chat_id, pairs, sme):
+def save_chat_pairs(chat_id, pairs, sme, approved=False):
     """Save the chosen pairs as verified answers and close the chat review."""
     c = get_chat(chat_id)
     if not c:
@@ -2520,12 +2731,13 @@ def save_chat_pairs(chat_id, pairs, sme):
     for p in pairs:
         q, a = (p.get("question") or "").strip(), (p.get("answer") or "").strip()
         if q and a:
-            teach(c["region"], q, a, sme, from_question=c.get("from_question"), variants=p.get("asked") or [])
+            teach(c["region"], q, a, sme, from_question=c.get("from_question"), variants=p.get("asked") or [],
+                  approved=approved, role="admin" if approved else "sme")
             n += 1
     with _conn() as con:
         con.execute("UPDATE sme_chats SET saved=1, saved_count=saved_count+? WHERE id=?", (n, chat_id))
     if n and c.get("from_question"):
-        _close([c["from_question"]], sme, "resolved", "Fixed")
+        _close([c["from_question"]], sme, *(("resolved", "Fixed") if approved else ("pending_approval", "In progress")))
     return n
 
 
@@ -2635,7 +2847,13 @@ def list_learned(region=None, source=None):
         return [dict(r) for r in con.execute(q + " ORDER BY id DESC", args)]
 
 
-def set_learned(lid, active=None, delete=False, make_verified=False, admin=""):
+def set_learned(lid, active=None, delete=False, make_verified=False, admin="", role="admin"):
+    with _conn() as con:
+        r = con.execute("SELECT region, question FROM learned WHERE id=?", (lid,)).fetchone()
+    if r and admin:
+        what = ("Deleted answer" if delete else "Made auto-learned answer verified" if make_verified
+                else "Switched answer on" if active else "Switched answer off")
+        log(admin, role, what, r["region"], f"answer #{lid}", r["question"])
     with _conn() as con:
         if delete:
             con.execute("DELETE FROM learned WHERE id=?", (lid,))
