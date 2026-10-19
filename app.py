@@ -165,6 +165,14 @@ CONF_HELP = ("Confidence % = how sure Vidya is that the answer comes from your d
              "Below Medium, Vidya does not answer and asks you to consult your supervisor.")
 
 
+def _asked_image(i):
+    """The screenshot the agent pasted with the question Vidya is asking about (already card-masked)."""
+    chat = ss.chats[region]
+    if 0 < i <= len(chat) and chat[i - 1].get("role") == "user":
+        return chat[i - 1].get("image")
+    return None
+
+
 def render_clarify(msg, i):
     """Vidya asks one short question (which GDS / which process) with buttons, then answers."""
     info = (msg.get("meta") or {}).get("clarify") or {}
@@ -177,12 +185,13 @@ def render_clarify(msg, i):
     for k, (c, o) in enumerate(zip(cols, opts)):
         if c.button(o["label"], key=f"cl{region}{i}_{k}", type="primary", width="stretch"):
             q = msg.get("question", "")
-            ss.pending_clarify = {"q": q + o.get("append", ""), "sub_lob": o.get("sub_lob") or msg.get("sub_lob")}
+            ss.pending_clarify = {"q": q + o.get("append", ""), "sub_lob": o.get("sub_lob") or msg.get("sub_lob"),
+                                  "image": _asked_image(i), "gds": o["label"] if info.get("group") == "GDS" else None}
             msg["picked"] = o["label"]
             st.rerun()
     if cols[-1].button("Search all", key=f"cl{region}{i}_all", width="stretch",
                        help="Answer without choosing - Vidya searches everything"):
-        ss.pending_clarify = {"q": msg.get("question", ""), "sub_lob": msg.get("sub_lob")}
+        ss.pending_clarify = {"q": msg.get("question", ""), "sub_lob": msg.get("sub_lob"), "image": _asked_image(i)}
         msg["picked"] = "Search all"
         st.rerun()
 
@@ -271,7 +280,7 @@ def render_answer(msg, i):
         elif msg.get("rated") != "pending":
             b1, b2, _ = st.columns([1.6, 2, 4])
             if b1.button("👍 Helpful", key=f"up{region}{i}"):
-                kb.give_feedback(msg["qid"], True, trusted=ss.is_admin)
+                kb.give_feedback(msg["qid"], True, voter=ss.user, role="sme" if ss.is_sme else "agent")
                 msg["rated"] = True
                 st.rerun()
             if b2.button("👎 Not helpful", key=f"dn{region}{i}"):
@@ -281,12 +290,12 @@ def render_answer(msg, i):
             with st.form(f"fb{region}{i}"):
                 note = st.text_area("What was wrong or missing? (optional)")
                 if st.form_submit_button("Send to process team"):
-                    kb.give_feedback(msg["qid"], False, note)
+                    kb.give_feedback(msg["qid"], False, note, voter=ss.user, role="sme" if ss.is_sme else "agent")
                     msg["rated"] = True
                     st.rerun()
 
 
-def ask_now(text, image=None, sub_lob=None, clarify=True):
+def ask_now(text, image=None, sub_lob=None, clarify=True, gds=None):
     chat = ss.chats[region]
     if image:                                   # card numbers hidden before it is shown, saved or sent to AI
         try:
@@ -303,7 +312,7 @@ def ask_now(text, image=None, sub_lob=None, clarify=True):
                  "lob": " › ".join(x for x in (region, sub_lob) if x)})
     where = f"{sub_lob} documents first" if sub_lob else f"{region} documents"
     with st.spinner("Reading your screenshot and searching SOPs…" if image else f"Searching {where}…"):
-        res = kb.ask(region, asked, ss.user, image=image, sub_lob=sub_lob, clarify=clarify)
+        res = kb.ask(region, asked, ss.user, image=image, sub_lob=sub_lob, clarify=clarify, gds=gds)
     if asked != text:
         res["meta"]["followup"] = asked
     chat.append({"role": "assistant", "content": res["answer"], "sources": res["sources"],
@@ -325,7 +334,7 @@ def page_ask():
         sme_notice()
     if ss.pending_clarify:
         pc, ss.pending_clarify = ss.pending_clarify, None
-        ask_now(pc["q"], sub_lob=pc.get("sub_lob"), clarify=False)
+        ask_now(pc["q"], image=pc.get("image"), sub_lob=pc.get("sub_lob"), clarify=False, gds=pc.get("gds"))
         st.rerun()
     if ss.pending_q:
         q, ss.pending_q = ss.pending_q, None

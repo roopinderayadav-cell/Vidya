@@ -867,3 +867,92 @@ def test_no_plane_left_in_the_screens():
     for f in ("ui.py", "app.py", "config.py", "admin_pages.py"):
         assert "\u2708" not in (here / f).read_text(encoding="utf-8"), f
     assert (here / "assets" / "vidya_hero.webp").exists() and (here / "assets" / "vidya_icon.webp").exists()
+
+
+# ---------------------------------------------------------------- v5.3: GDS always asked, learning rule, report
+def test_gds_always_asked_even_when_a_learned_answer_exists():
+    kb.add_document("GLOBAL", "SOP", "GDS Void Guide", "void.docx", _docx_with_picture(), "admin")
+    kb.teach("APAC", "how to void a ticket", "Amadeus: TWX/L5. Sabre: WV1.", "sme")      # covers both
+    r = kb.ask("APAC", "how to void a ticket", "agent1")
+    assert r["result"] == "clarify"
+    assert [o["label"] for o in r["meta"]["clarify"]["options"]] == ["Amadeus", "Sabre"]
+    a = kb.ask("APAC", "how to void a ticket in Sabre", "agent1", clarify=False, gds="Sabre")
+    assert a["result"] == "answered" and "WV1" in a["answer"] and "TWX" not in a["answer"]
+
+
+def test_gds_learned_answer_for_other_gds_is_not_used():
+    kb.add_document("GLOBAL", "SOP", "GDS Void Guide", "void.docx", _docx_with_picture(), "admin")
+    kb.teach("APAC", "how to void a ticket in Amadeus", "Amadeus only: TWX/L5 then check VOID.", "sme")
+    a = kb.ask("APAC", "how to void a ticket in Sabre", "agent1", clarify=False)
+    assert "WV1" in a["answer"] and "TWX" not in a["answer"]
+
+
+def test_gds_named_and_non_gds_questions():
+    assert kb.gds_named("price it with FXP please") == "Amadeus"
+    assert kb.gds_named("check TQT") == "Amadeus" and kb.gds_named("run WPNC") == "Sabre"
+    assert kb.gds_named("void in 1S") == "Sabre" and kb.gds_named("void in amadeus") == "Amadeus"
+    assert kb.gds_named("wp is my initials") is None and kb.gds_named("how to void a ticket") is None
+    kb.add_document("GLOBAL", "SOP", "GDS Void Guide", "void.docx", _docx_with_picture(), "admin")
+    assert kb.ask("APAC", "which gds command to void the ticket", "a")["result"] == "clarify"
+    assert kb.ask("APAC", "what is the travel policy for hotel booking", "a")["result"] != "clarify"
+
+
+def _voted_question():
+    kb.add_document("GLOBAL", "SOP", "GDS Void Guide", "void.docx", _docx_with_picture(), "admin")
+    r = kb.ask("APAC", "how to void a ticket in Sabre", "agent0", clarify=False)
+    assert r["result"] == "answered" and r["sources"][0]["key"].startswith("c")
+    return r
+
+
+def _auto(active_only=True):
+    with kb._conn() as con:
+        return con.execute("SELECT COUNT(*) FROM learned WHERE source='auto'"
+                           + (" AND active=1" if active_only else "")).fetchone()[0]
+
+
+def test_learning_needs_10_agents_2_smes_and_80_percent():
+    r = _voted_question()
+    for n in range(9):
+        kb.give_feedback(r["id"], True, voter=f"agent{n}", role="agent")
+    kb.sme_vote(r["id"], "sme1", True)
+    kb.sme_vote(r["id"], "sme2", True)
+    assert _auto() == 0                                         # 9 agents: not yet
+    assert kb._feedback_multipliers("APAC", "how to void a ticket in Sabre") == {}
+    kb.give_feedback(r["id"], True, voter="agent3", role="agent")  # same person again: still 9
+    assert _auto() == 0
+    kb.give_feedback(r["id"], True, voter="agent9", role="agent")  # 10th different agent
+    assert _auto() == 1
+    assert kb._feedback_multipliers("APAC", "how to void a ticket in Sabre")
+    for n in range(3):                                          # 12 👍 / 15 = 80% -> still learned
+        kb.give_feedback(r["id"], False, voter=f"other{n}", role="agent")
+    assert _auto() == 1
+    kb.give_feedback(r["id"], False, voter="other3", role="agent")   # 12 / 16 = 75% -> switched off
+    assert _auto() == 0 and _auto(active_only=False) == 1
+    assert kb._feedback_multipliers("APAC", "how to void a ticket in Sabre") == {}   # and no penalty either
+
+
+def test_smes_needed_even_with_many_agents():
+    r = _voted_question()
+    for n in range(15):
+        kb.give_feedback(r["id"], True, voter=f"agent{n}", role="agent")
+    kb.sme_vote(r["id"], "sme1", True)
+    assert _auto() == 0
+    item = [x for x in kb.answers_to_confirm("APAC") if x["qid"] == r["id"]][0]
+    assert item["agents_up"] == 15 and item["smes_up"] == 1 and not item["approved"]
+    kb.sme_vote(r["id"], "sme2", True)
+    assert _auto() == 1
+
+
+def test_feedback_report_has_names_and_downloads():
+    import openpyxl
+    r = _voted_question()
+    kb.give_feedback(r["id"], False, "steps are old, card 4111111111111111", voter="Ravi", role="agent")
+    kb.sme_vote(r["id"], "Priya", True)
+    rep = kb.feedback_report("APAC", None, "👎 Not helpful")
+    assert len(rep) == 1 and rep.iloc[0]["Asked by"] == "agent0" and "steps are old" in rep.iloc[0]["Comment (what was wrong)"]
+    assert "4111111111111111" not in rep.to_string()
+    votes = kb.votes_df("APAC")
+    assert {"Ravi", "Priya"} <= set(votes["voter"]) and set(votes["role"]) == {"Agent", "SME"}
+    wb = openpyxl.load_workbook(io.BytesIO(kb.report_excel(rep, votes)))
+    assert wb.sheetnames == ["Questions & feedback", "All votes (who rated)"]
+    assert wb["All votes (who rated)"].max_row == len(votes) + 1

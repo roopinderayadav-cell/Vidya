@@ -1,23 +1,14 @@
-Vidya v5.2 - update your Vidya GitHub repository (the one set up from v5.1)
-============================================================================
+Vidya v5.3 - upload steps (only changed files)
 
-1. Unzip this file.
-2. GitHub -> your PRIVATE "vidya" repository -> "Add file" -> "Upload files".
-   Drag in everything from this folder (keep the folders "assets" and "tests_data" as they are):
-      app.py, ui.py, config.py, knowledge.py, privacy.py, farerule.py (NEW), test_vidya.py,
-      README.md, START_APP.bat,
-      assets/vidya_icon.png, assets/vidya_icon.webp (NEW), assets/vidya_hero.webp (NEW),
-      tests_data/fare_rules_samples.json (NEW), tests_data/fare_rules_expected.json (NEW)
-   (This UPLOAD_STEPS.txt does not need to go in.)
-3. Delete the old logo, it is no longer used:
-      assets/vidya_logo.png  -> open it -> ... -> Delete file -> Commit changes
-4. Commit message:  Vidya v5.2 - new look, Fare Rule Reader, three penalty checks
-5. Streamlit updates the app by itself in 1-2 minutes (if not: ... -> Reboot app).
+1. Open your Vidya repository on GitHub -> Add file -> Upload files.
+2. Drag in these 7 files (they replace the old ones in the main folder):
+   app.py, admin_pages.py, knowledge.py, config.py, test_vidya.py, README.md, ui.py
+   (ui.py is the image fix sent earlier - same file; upload it again if you are not sure)
+3. Commit message:  Vidya v5.3 - always ask GDS, 10+2 votes and 80% learning rule, feedback report
+4. Nothing to delete. No change to Secrets, requirements.txt or packages.txt.
+5. Streamlit restarts the app by itself (if not: Manage app -> Reboot).
 
-No change to Secrets, requirements.txt or packages.txt.
-
-Check after the update:
-   - Sign-in page: robot in the header, banner "Hi there, how can Vidya help you today?" with the robot reading.
-   - Paste a fare rule (category 16 from Amadeus or Sabre) into the question box and add
-     "change before departure fee?" - Vidya answers with the fee, the rule lines it used and the 3 checks.
-   - Ask "what is the no show penalty" - the 3 checks show under the answer.
+First start after the update (automatic, one time):
+- Older 👍/👎 votes are linked to the person who asked.
+- Answers auto-learned under the old rule (2 👍) are switched off, not deleted:
+  Admin -> Learned Answers -> Auto-learned. Switch one back on there if you are sure it is right.

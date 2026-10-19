@@ -1,9 +1,29 @@
-# Vidya v5.2 - Your AI Learning & Knowledge Assistant (NORAM · EUROPE · APAC)
+# Vidya v5.3 - Your AI Learning & Knowledge Assistant (NORAM · EUROPE · APAC)
 
 Vidya is the team's AI knowledge assistant (formerly iKnow / OpsMate). Agents ask questions in
 plain words (typos and Hindi/Kannada/Telugu in English letters are fine) or paste a screenshot,
 and get one short answer with its SOP source and a confidence level. When Vidya is not sure it
 says: "I do not have answer to this question, please consult with your team supervisor."
+
+## What's new in Vidya v5.3 - GDS question, stricter learning, feedback report
+- **"Which GDS?" every time:** a GDS question (commands, entries, PNR, TST, void, reissue, exchange, ...)
+  without Amadeus / Sabre named always gets the buttons **Amadeus · Sabre** first - a learned answer, 👍 votes or
+  a document covering both no longer skip it. Not asked when the GDS is clear from the words (Amadeus, 1A, Sabre,
+  1S, a misspelling like "Amadus") or from a GDS-only command (TQT, FXP, TST = Amadeus; WPNC, WFR, PQ = Sabre),
+  nor for meaning questions ("What is a PNR?"). Works with screenshots too. After the choice, the other GDS's
+  passages and SME answers drop down, and an SME answer written for both shows only the chosen GDS's part.
+  If the documents have nothing for the chosen GDS, Vidya says so and sends it to the SME (never the other GDS's
+  command). Settings in config.py: `GDS_ALWAYS_ASK`, `GDS_OPTIONS`, `GDS_WORDS`, `GDS_COMMANDS`.
+- **Learning from 👍 has a strict rule:** an answer is learned only with 👍 from **10 different agents** and
+  **2 different SMEs**, and **80%+** of everyone who rated it said 👍 (each person's last vote counts once).
+  Below the rule, votes change nothing in either direction (no boost, no penalty); 👎 still goes to the SME
+  Desk. A learned answer that falls below 80% is switched off automatically. SMEs vote in
+  **SME Desk → 👍 Answers to confirm**. Answers auto-learned under the old 2-vote rule are switched off (not
+  deleted - see Learned Answers). Settings: `LEARN_AGENT_VOTES`, `LEARN_SME_VOTES`, `LEARN_MIN_POSITIVE_PCT`.
+- **Questions & feedback report** (Admin → Dashboard, bottom): filter by 👎 / 👍 / no answer / all and by name;
+  shows question, Vidya's answer, rating, comment, who asked; "Who rated what" lists every vote with name and
+  role (agent / SME). **Download report (Excel)** gives both as sheets. Card numbers are already masked.
+- Images are found in the `assets` folder or the main folder.
 
 ## What's new in Vidya v5.2 - new look and the Fare Rule Reader
 - **New look:** the Vidya robot in the header (round icon), the welcome banner with the robot reading,

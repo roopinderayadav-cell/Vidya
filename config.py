@@ -179,8 +179,14 @@ CONF_BANDS = {"high": (80, 98), "medium": (60, 79), "low": (20, 59)}
 
 # ---- Self-learning --------------------------------------------------------
 AUTO_LEARN = True         # save answers that staff mark 👍 as "auto-learned"
-AUTO_LEARN_MIN_VOTES = 2  # 👍 from this many DIFFERENT people before an answer is auto-learned
-                          # (an admin's 👍 counts as enough on its own)
+# Vidya learns from 👍 only when BOTH are reached for the same answer (similar questions count together):
+LEARN_AGENT_VOTES = 10    # 👍 from this many DIFFERENT agents
+LEARN_SME_VOTES = 2       # ...and from this many DIFFERENT SMEs (an admin counts as an SME)
+# Until then 👍 does not move answers up. SMEs confirm answers in SME Desk → "👍 Answers to confirm".
+LEARN_MIN_POSITIVE_PCT = 80  # ...and at least this % of the people who rated it gave 👍 (each person's last vote
+                             # counts). Below 80% nothing is learned either way: no boost, no penalty.
+LEARN_APPROVED_BOOST = 1.5  # an answer that reached both counts ranks this much higher for similar questions
+AUTO_LEARN_MIN_VOTES = LEARN_AGENT_VOTES   # old name, kept so older code still reads a number
 FEEDBACK_SIMILARITY = 0.55  # how similar a new question must be to reuse past 👍/👎
 
 # ---- AI providers ----------------------------------------------------------
@@ -254,10 +260,28 @@ MULTI_PART = True
 # Ask a short question first when the answer depends on something the agent did not say
 ASK_CLARIFY = True
 CLARIFY_GROUPS = {"GDS": ["Amadeus", "Sabre", "Galileo", "Worldspan", "Apollo"]}
-CLARIFY_ALIASES = {"Amadeus": ["1A", "ama"], "Sabre": ["1S"], "Galileo": ["1G", "Travelport"],
+CLARIFY_ALIASES = {"Amadeus": ["1A", "ama", "amadus", "amedeus", "amadues", "amedus", "amdeus", "amadeous"],
+                   "Sabre": ["1S", "saber", "sabr"], "Galileo": ["1G", "Travelport"],
                    "Worldspan": ["1P"], "Apollo": ["1V"]}
 CLARIFY_CLOSE = 0.70          # other variants count when they score at least 70% of the best one
 CLARIFY_MIN_COVER = 0.5       # ...and match at least half of the question's key words
+# GDS questions: when the agent does not say which GDS, Vidya ALWAYS asks first - even when a learned
+# answer, 👍 votes or a document covering both would otherwise answer straight away.
+GDS_ALWAYS_ASK = True
+GDS_OPTIONS = ["Amadeus", "Sabre"]            # the buttons Vidya shows
+# Words that make a question a GDS question (whole words, any case)
+GDS_WORDS = ["gds", "command", "commands", "entry", "entries", "cryptic", "format", "pnr", "pnrs", "tst",
+             "tsts", "tqt", "pq", "pqs", "queue", "queues", "emd", "emds", "void", "voiding", "reissue",
+             "re-issue", "reissuing", "revalidate", "revalidation", "exchange", "exchanges", "ssr", "osi",
+             "fop", "itinerary", "segment", "segments", "pricing", "reprice", "repricing", "fare quote",
+             "issue ticket", "issue a ticket", "issue the ticket", "ticket issue", "ticket issuance",
+             "ticketing error", "error message", "refund mask", "remark", "remarks", "pcc", "oid",
+             "office id", "atc", "fxp", "fxb", "fxx", "fxq", "ttp", "wpnc", "wfr", "*pq"]
+# Commands that already tell which GDS it is (the agent typed a GDS-specific entry)
+GDS_COMMANDS = {"Amadeus": ["TST", "TSTs", "TQT", "TTP", "FXP", "FXB", "FXX", "FXQ", "FXR", "FXA", "TTK", "TRDC", "TWD",
+                            "RTSTR", "RTTN", "TRF", "TRFU", "TRFP", "ETK", "FQD", "FQN"],
+                "Sabre": ["WPNC", "WPNCB", "WFR", "WETR", "PQ", "*PQ", "*IA", "*T", "W¥", "WP", "QXP", "TAW",
+                          "WFRF", "WETR*"]}
 # Showing document pictures with answers (works without the AI key)
 SHOW_ANSWER_IMAGES = True
 MAX_ANSWER_IMAGES = 2         # pictures shown under one answer

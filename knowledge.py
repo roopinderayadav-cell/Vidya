@@ -118,6 +118,28 @@ def init_db():
         _add_cols(con, "learned", [("source", "TEXT DEFAULT 'verified'"),
                                    ("active", "INTEGER DEFAULT 1"), ("votes", "INTEGER DEFAULT 0"),
                                    ("embedding", "BLOB"), ("lob", "TEXT DEFAULT ''")])
+        # v5.3: who voted (agent / SME), which GDS a learned answer is for, which passage it came from
+        _add_cols(con, "feedback_pairs", [("voter", "TEXT"), ("role", "TEXT DEFAULT 'agent'"),
+                                          ("qid", "INTEGER")])
+        _add_cols(con, "learned", [("gds", "TEXT DEFAULT ''"), ("source_key", "TEXT DEFAULT ''")])
+        done = con.execute("SELECT value FROM app_settings WHERE key='learn_rule_v53'").fetchone()
+        if not done:
+            # older votes: the person is the one who asked (only they could rate their own answer then)
+            for r in con.execute("SELECT id, region, question, value FROM feedback_pairs "
+                                 "WHERE voter IS NULL").fetchall():
+                q = con.execute("SELECT id, asked_by FROM questions WHERE region=? AND feedback=? AND "
+                                "(question=? OR question=? || ' [screenshot]') ORDER BY id DESC LIMIT 1",
+                                (r["region"], r["value"], r["question"], r["question"])).fetchone()
+                if q:
+                    con.execute("UPDATE feedback_pairs SET voter=?, role='agent', qid=? WHERE id=?",
+                                (q["asked_by"], q["id"], r["id"]))
+            # answers auto-learned under the old rule (2 👍) do not meet the new one: switched off, not deleted
+            con.execute("UPDATE learned SET active=0 WHERE source='auto' AND COALESCE(source_key,'')=''")
+            for r in con.execute("SELECT id, question, answer FROM learned").fetchall():
+                g = gds_named(r["question"]) or _one_gds(r["answer"])
+                if g:
+                    con.execute("UPDATE learned SET gds=? WHERE id=?", (g, r["id"]))
+            con.execute("INSERT OR REPLACE INTO app_settings (key, value) VALUES ('learn_rule_v53', ?)", (_now(),))
 
 
 # ---------------------------------------------------------------------------
@@ -880,7 +902,8 @@ def _library_signature():
             " + LENGTH(COALESCE(doc_type, ''))), 0) FROM documents),"
             " (SELECT COUNT(*) || ':' || COALESCE(MAX(id), 0) || ':' || COALESCE(SUM(LENGTH(question) + LENGTH(answer)"
             " + LENGTH(COALESCE(variants, '')) + COALESCE(active, 1) * 7 + LENGTH(COALESCE(region, ''))"
-            " + LENGTH(COALESCE(source, '')) + LENGTH(COALESCE(embedding, ''))), 0) FROM learned)").fetchone())
+            " + LENGTH(COALESCE(source, '')) + LENGTH(COALESCE(embedding, '')) + LENGTH(COALESCE(gds, ''))), 0)"
+            " FROM learned)").fetchone())
 
 
 def _cached(region, all_regions):
@@ -912,7 +935,7 @@ def _load_candidates(region, all_regions=False):
             "FROM chunks c JOIN documents d ON d.id = c.doc_id "
             f"WHERE c.region IN ({marks}) AND COALESCE(d.status,'Active')='Active'", regions).fetchall()
         learned = con.execute(
-            "SELECT id, question, answer, added_by, added_at, region, source, embedding, lob, variants FROM learned "
+            "SELECT id, question, answer, added_by, added_at, region, source, embedding, lob, variants, gds FROM learned "
             f"WHERE region IN ({marks}) AND COALESCE(active,1)=1", regions).fetchall()
     items = [
         {"kind": "doc", "text": r["text"], "title": r["title"], "type": r["doc_type"],
@@ -935,7 +958,8 @@ def _load_candidates(region, all_regions=False):
              "region": l["region"], "question": l["question"], "doc": f"l{l['id']}",
              "key": f"l{l['id']}", "vec": _blob_to_vec(l["embedding"]),
              "search": f"{l['question']} {l['question']} {l['variants'] or ''} {l['answer']}",
-             "lob": l["lob"] or "", "sub_lob": ""})
+             "lob": l["lob"] or "", "sub_lob": "",
+             "gds": l["gds"] or ""})
     return items
 
 
@@ -953,22 +977,15 @@ def _norm(text):
 
 
 def _feedback_multipliers(region, query):
-    """SELF-LEARNING: passages staff marked 👍 / 👎 for SIMILAR questions are
-    moved up (x1.3 per vote, max x1.9) or down (x0.5 per vote)."""
-    with _conn() as con:
-        rows = con.execute("SELECT question, source_key, value FROM feedback_pairs "
-                           "WHERE region IN (?,?)", (region, config.GLOBAL_REGION)).fetchall()
-    if not rows:
-        return {}
-    texts = [r["question"] for r in rows]
-    vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5)).fit(texts + [query])
-    sims = cosine_similarity(vec.transform([query]), vec.transform(texts)).ravel()
-    mult = {}
-    for r, s in zip(rows, sims):
-        if s >= config.FEEDBACK_SIMILARITY:
-            m = mult.get(r["source_key"], 1.0)
-            mult[r["source_key"]] = min(1.9, m * 1.3) if r["value"] > 0 else m * 0.5
-    return mult
+    """SELF-LEARNING from 👍 / 👎 - only by the rule: a passage moves up for similar questions when
+    LEARN_AGENT_VOTES agents + LEARN_SME_VOTES SMEs gave 👍 and >= LEARN_MIN_POSITIVE_PCT % of the
+    people who rated it gave 👍. Otherwise votes change nothing (no boost, no penalty);
+    👎 still sends the question to the SME / process team."""
+    rows = _similar_votes(region, query)
+    by_key = {}
+    for r in rows:
+        by_key.setdefault(r["source_key"], []).append(r)
+    return {k: config.LEARN_APPROVED_BOOST for k, rs in by_key.items() if _tally(rs)["approved"]}
 
 
 def lob_factor(item, region, sub_lob=None):
@@ -1395,8 +1412,14 @@ def search(region, queries, k=config.CANDIDATES, fmt="short", query_vec=None, su
         for i, sim in zip(faq_idx, fsim):
             items[i]["faqsim"] = float(sim)
     term = definition_term(queries[0])
+    gds = gds_named(" ".join(queries) + " " + (raw or ""))       # the agent chose / named a GDS
+    gds_names = config.CLARIFY_GROUPS.get("GDS", [])
     for idx, item in enumerate(items):
         boost = 1.0
+        if gds:                          # passages / learned answers for the OTHER GDS drop well down
+            other = (item.get("gds") if item["kind"] == "learned" else _variant(item, gds_names))
+            if other and other != gds:
+                boost *= 0.35
         if term and _defines(item.get("location", ""), term):
             boost *= config.DEFINITION_BOOST     # "what is AGM" -> the passage that defines AGM, not one that only uses it
         fs = item.get("faqsim", 0)
@@ -1501,6 +1524,129 @@ def _variant(hit, names):
     return found[0] if len(found) == 1 else None
 
 
+def _gds_aliases():
+    names = config.CLARIFY_GROUPS.get("GDS", [])
+    return {n: [n] + config.CLARIFY_ALIASES.get(n, []) for n in names}
+
+
+def gds_named(text):
+    """Which GDS the agent named ('in Amadeus', '1S', or a GDS-only command like TQT / WPNC), else None."""
+    t = " " + (text or "") + " "
+    for name, aliases in _gds_aliases().items():
+        if any(re.search(rf"(?<![\w*]){re.escape(a)}(?!\w)", t, re.I) for a in aliases):
+            return name
+    for name, cmds in getattr(config, "GDS_COMMANDS", {}).items():
+        for c in cmds:      # commands are upper case in GDS: only an UPPER-CASE word counts ('wp' in text does not)
+            if re.search(rf"(?<![\w*]){re.escape(c)}(?![A-Za-z])", t):
+                return name
+    return None
+
+
+def _one_gds(text):
+    """The GDS a text is about when it names exactly one."""
+    head = text or ""
+    found = [n for n, al in _gds_aliases().items()
+             if any(re.search(rf"(?<!\w){re.escape(a)}(?!\w)", head, re.I) for a in al)]
+    return found[0] if len(found) == 1 else None
+
+
+_GDS_WORD_RE = None
+
+
+def gds_words_in(text):
+    """True when the question uses GDS vocabulary (PNR, TST, void, reissue, command, ...)."""
+    global _GDS_WORD_RE
+    if _GDS_WORD_RE is None:
+        words = sorted(getattr(config, "GDS_WORDS", []), key=len, reverse=True)
+        _GDS_WORD_RE = re.compile(r"(?<![\w*])(" + "|".join(re.escape(w) for w in words) + r")(?!\w)", re.I)
+    return bool(_GDS_WORD_RE.search(text or ""))
+
+
+_MEANING_Q = re.compile(r"(?i)^\s*(what\s+(is|are|does)\b.*\b(mean|meaning|stand\s+for)\b|what\s+(is|are)\s+(an?\s+|the\s+)?"
+                        r"[\w/&.\-]+(\s+(and|or)\s+[\w/&.\-]+)?\s*\??\s*$|(full\s+form|meaning|define|definition)\b"
+                        r"|.*\b(full\s+form|stands?\s+for|meaning\s+of)\b)")
+
+
+def _is_meaning_question(text):
+    """'What is a GDS?', 'What does PQ mean?', 'TPM full form' - the meaning is the same in every GDS."""
+    t = (text or "").strip()
+    return bool(definition_term(t) or _MEANING_Q.match(t))
+
+
+def gds_section(hit):
+    """The GDS a passage is written for, by its SECTION heading or document title only
+    ('Amadeus - How to void a ticket'). A passage that only mentions Amadeus somewhere does not count."""
+    if hit.get("kind") != "doc":
+        return None
+    for field in (hit.get("location", ""), hit.get("title", "")):
+        found = [n for n, al in _gds_aliases().items()
+                 if any(re.search(rf"(?<!\w){re.escape(a)}(?!\w)", field or "", re.I) for a in al)]
+        if len(found) == 1:
+            return found[0]
+    return None
+
+
+def gds_question(region, question, queries, sub_lob=None, query_vec=None, extra=""):
+    """A GDS question the agent did not say the GDS for -> True (Vidya then always asks which GDS).
+    It counts as a GDS question when the agent says 'GDS', or when it uses GDS words AND the best
+    documents for it have Amadeus / Sabre sections (so the steps really differ by GDS).
+    Learned answers and 👍 votes are ignored here on purpose: they never skip the question."""
+    if not getattr(config, "GDS_ALWAYS_ASK", True) or not config.ASK_CLARIFY:
+        return False
+    text = f"{question} {extra}"
+    if gds_named(text) or _is_meaning_question(question):
+        return False                                   # GDS already known / a meaning ('what is a PNR?')
+    hits = [h for h in search(region, queries, k=12, query_vec=query_vec, sub_lob=sub_lob, per_doc=12)
+            if h["kind"] == "doc"]
+    if not hits:
+        return False
+    top = hits[0]
+    if top["lex"] < config.CONF_MEDIUM and (top["sem"] or 0) < config.SEM_MEDIUM:
+        return False                                   # nothing relevant in the documents at all
+    near = [h for h in hits[:6] if h["score"] >= top["score"] * 0.5]
+    if gds_section(top):
+        return True                                    # the best SOP section is written for one GDS
+    # GDS words in the question ('command', 'entry', 'PNR', 'TST', ...) and the answer passages are per GDS
+    # or talk about a GDS
+    plain = re.sub(r"(?i)\bnon[\s-]*gds\b", " ", text)
+    if not gds_words_in(plain):
+        return False
+    if any(gds_section(h) for h in near):
+        return True
+    names = config.CLARIFY_GROUPS.get("GDS", [])
+    mentions = any(re.search(rf"(?<!\w)({'|'.join(map(re.escape, names))})(?!\w)", h.get("text", ""), re.I)
+                   for h in near[:3])
+    return gds_words_in(plain) and mentions
+
+
+_GDS_MARK = re.compile(r"(?im)(?:^|(?<=[.;\n]))\s*(?:\*\*)?(?:in |for |on )?(amadeus|sabre|1a|1s)(?:\*\*)?\s*(?:\*\*)?[:\-–]")
+
+
+def gds_part(text, gds):
+    """An answer written for both GDS ('Amadeus: TWX/L5. Sabre: WV1.') -> only the chosen GDS's part
+    (plus any lines before the first GDS label). Text that is not split by GDS comes back unchanged."""
+    if not text or not gds:
+        return text
+    marks = list(_GDS_MARK.finditer(text))
+    names = {"1a": "amadeus", "1s": "sabre"}
+    labels = {names.get(m.group(1).lower(), m.group(1).lower()) for m in marks}
+    if len(labels) < 2 or gds.lower() not in labels:
+        return text
+    keep = [text[:marks[0].start()].strip()]
+    for k, m in enumerate(marks):
+        end = marks[k + 1].start() if k + 1 < len(marks) else len(text)
+        if names.get(m.group(1).lower(), m.group(1).lower()) == gds.lower():
+            keep.append(text[m.start():end].strip())
+    return "\n".join(x for x in keep if x)
+
+
+def gds_options(question=""):
+    """The 'Which GDS?' question with one button per GDS."""
+    return {"kind": "variant", "group": "GDS",
+            "question": "Which GDS is this for? The steps are different in each.",
+            "options": [{"label": g, "append": f" in {g}"} for g in getattr(config, "GDS_OPTIONS", ["Amadeus", "Sabre"])]}
+
+
 def clarify_options(region, question, queries, sub_lob=None, query_vec=None, anchor=None):
     """When the best answers split between variants the agent did not mention (Amadeus vs Sabre, or two
     sub-LOBs when no sub-LOB is selected), return a short question with buttons instead of guessing."""
@@ -1510,7 +1656,10 @@ def clarify_options(region, question, queries, sub_lob=None, query_vec=None, anc
     if not hits:
         return None
     st_ = brain.core_text(question)
-    top = hits[0]
+    docs = [h for h in hits if h["kind"] == "doc"]         # a learned answer never hides the choice
+    if not docs:
+        return None
+    top = docs[0]
     if top["lex"] < config.CONF_MEDIUM and (top["sem"] or 0) < config.SEM_MEDIUM:
         return None                                        # weak match: nothing to choose between
     close = [h for h in hits if h["score"] >= top["score"] * config.CLARIFY_CLOSE
@@ -1522,6 +1671,9 @@ def clarify_options(region, question, queries, sub_lob=None, query_vec=None, anc
         aliases = [a for n in names for a in [n] + config.CLARIFY_ALIASES.get(n, [])]
         if any(re.search(rf"\b{re.escape(a.lower())}\b", ql) for a in aliases):
             continue                                       # the agent already said which one
+        if group == "GDS" and (gds_named(question) or _is_meaning_question(question)):
+            continue                                       # a GDS-only command (FXP, WPNC) / 'what is a PNR?'
+
         if not close or not _variant(close[0], names):
             continue                                       # the best answer is not specific to one variant
         found = []
@@ -1529,6 +1681,9 @@ def clarify_options(region, question, queries, sub_lob=None, query_vec=None, anc
             v = _variant(h, names)
             if v and v not in found:
                 found.append(v)
+        if (group == "GDS" and getattr(config, "GDS_ALWAYS_ASK", True)
+                and any(gds_section(h) for h in close[:3])):
+            return gds_options(question)                   # always Amadeus / Sabre, even if only one was found
         if len(found) >= 2:
             return {"kind": "variant", "group": group,
                     "question": f"Which {group} is this for? The steps are different in each.",
@@ -1546,7 +1701,7 @@ def clarify_options(region, question, queries, sub_lob=None, query_vec=None, anc
     return None
 
 
-def ask(region, question, asked_by, image=None, sub_lob=None, clarify=True, _part=False):
+def ask(region, question, asked_by, image=None, sub_lob=None, clarify=True, _part=False, gds=None):
     """question: what the staff member typed (can be empty if they only pasted a screenshot)
     image: bytes of a pasted screenshot, or None. region = the LOB tab, sub_lob = the chip.
     Returns a dict for the screen."""
@@ -1604,8 +1759,24 @@ def ask(region, question, asked_by, image=None, sub_lob=None, clarify=True, _par
 
     state = {"fixed": fixed, "changes": changes, "fmt": fmt, "queries": queries, "raw": fixed}
 
-    # --- Not clear which GDS / process? Ask first (one click), then answer -------
-    # "what is X?" asks for a meaning, which does not depend on the GDS - never ask "Amadeus or Sabre?" for it
+    # --- A GDS question without the GDS: ALWAYS ask "Amadeus or Sabre?" first (one click) -------
+    # Nothing skips this - not a learned answer, not 👍 votes, not a document covering both GDS.
+    gds = gds or gds_named(question) or gds_named(fixed) or gds_named(shot_text)   # 'Amadus' -> Amadeus too
+    if (clarify and not gds and not _part
+            and gds_question(region, fixed, queries, sub_lob=sub_lob, query_vec=qvec, extra=shot_text[:400])):
+        opts = gds_options(fixed)
+        meta.update({"clarify": opts, "lob": region, "sub_lob": sub_lob or "",
+                     "seconds": round(time.time() - t0, 1), "mode": "documents"})
+        return {"id": None, "answer": opts["question"], "sources": [], "result": "clarify",
+                "found": False, "confidence": None, "confidence_pct": None, "meta": meta,
+                "question": question, "images": []}
+    if gds:
+        meta["gds"] = gds
+        if not gds_named(question):          # the screenshot showed the GDS: search for that GDS
+            state["queries"] = queries = queries + [f"{brain.search_text(fixed)} {gds}"]
+
+    # --- Not clear which process (sub-LOB)? Ask first (one click), then answer -------
+    # "what is X?" asks for a meaning, which does not depend on the sub-LOB
     if definition_term(fixed):
         clarify = False
     if clarify and not image:
@@ -1790,7 +1961,9 @@ def ask(region, question, asked_by, image=None, sub_lob=None, clarify=True, _par
     if not _part and not image and getattr(config, "MULTI_PART", True):
         parts = brain.split_parts(question)          # the agent's own words (each part is spell-fixed itself)
         if len(parts) >= 2 and _parts_missing(r, parts):
-            subs = [(p, ask(region, p, asked_by, sub_lob=sub_lob, clarify=False, _part=True)) for p in parts]
+            # each part keeps the GDS the agent chose ("unused ticket and fare changed in Amadeus")
+            subs = [(p, ask(region, p if (not gds or gds_named(p)) else f"{p} in {gds}", asked_by,
+                            sub_lob=sub_lob, clarify=False, _part=True, gds=gds)) for p in parts]
             if sum(1 for _, x in subs if x["result"] == "answered") >= 1:
                 multi = _combine_parts(subs)
                 r.update(result="answered", answer=multi["answer"], hits=multi["hits"], best=multi["best"],
@@ -1800,12 +1973,14 @@ def ask(region, question, asked_by, image=None, sub_lob=None, clarify=True, _par
                 meta["parts"] = multi["parts"]
                 meta["notes"] += multi["notes"]
     result, answer, important = r["result"], r["answer"], r["important"]
+    if gds and result == "answered":
+        answer = gds_part(answer, gds)          # an answer written for both GDS: only the chosen one
     conflict_pair, conflict_text, mode = r["conflict_pair"], r["conflict_text"], r["mode"]
     hits, best, cover, conf = r["hits"], r["best"], r["cover"], r["conf"]
     fixed, changes, fmt = state["fixed"], state["changes"], state["fmt"]
 
     # the answer came from e.g. an Amadeus section although the agent did not say Amadeus: ask first
-    if clarify and not image and not multi and result == "answered" and best and best["kind"] == "doc":
+    if clarify and not gds and not multi and result == "answered" and best and best["kind"] == "doc":
         opts = clarify_options(region, fixed, state["queries"], sub_lob=sub_lob, query_vec=qvec, anchor=best)
         if opts and opts["kind"] == "variant":
             meta.update({"clarify": opts, "lob": region, "sub_lob": sub_lob or "",
@@ -1889,47 +2064,103 @@ def ask(region, question, asked_by, image=None, sub_lob=None, clarify=True, _par
 # 6. LEARNING LOOP
 # ===========================================================================
 
-def give_feedback(qid, helpful: bool, comment="", trusted=False):
-    """👍 / 👎 from staff. This is where Vidya learns by itself."""
+def give_feedback(qid, helpful: bool, comment="", trusted=False, voter=None, role="agent"):
+    """👍 / 👎 on an answer. voter = who clicked, role = 'agent' or 'sme' (an admin counts as an SME).
+    Vidya learns only when an answer reaches LEARN_AGENT_VOTES agents + LEARN_SME_VOTES SMEs with 👍
+    AND at least LEARN_MIN_POSITIVE_PCT % of the people who rated it gave 👍 (see _tally)."""
     with _conn() as con:
         q = con.execute("SELECT * FROM questions WHERE id=?", (qid,)).fetchone()
         if not q:
             return
         con.execute("UPDATE questions SET feedback=?, comment=? WHERE id=?",
                     (1 if helpful else -1, privacy.mask(comment), qid))
-        if not helpful:
+        if not helpful:                    # 👎 always goes to the SME / process team to look at
             con.execute("UPDATE questions SET status='needs_review', gap_status=COALESCE(gap_status,'Open'), "
                         "sme_reason='Not helpful 👎' WHERE id=?", (qid,))
-        sources = json.loads(q["sources"] or "[]")
-        question = re.sub(r"\s*\[screenshot\]$", "", q["question"])
-        for s in sources[:2]:              # the passages that produced the answer
-            if s.get("key"):
-                con.execute("INSERT INTO feedback_pairs (region, question, source_key, value, at) "
-                            "VALUES (?,?,?,?,?)", (q["region"], question, s["key"],
-                                                   1 if helpful else -1, _now()))
-        if not helpful:                    # a wrong auto-learned answer is switched off
-            for s in sources[:1]:
-                if s.get("key", "").startswith("l") and s.get("type") == "Auto-learned Q&A":
-                    con.execute("UPDATE learned SET active=0 WHERE id=? AND source='auto'",
-                                (int(s["key"][1:]),))
-    if helpful and config.AUTO_LEARN and q["result"] == "answered":
-        _auto_learn(q, question, trusted)
+    _record_votes(q, helpful, voter or q["asked_by"], role)
 
 
-def _auto_learn(q, question, trusted=False):
-    """Save an answer staff found helpful so similar questions get it straight away."""
-    if not sources_from_documents(q):
-        return                             # already a learned answer - nothing new to save
+def _vote_key(con, key):
+    """A vote on an auto-learned answer counts for the document passage it was learned from."""
+    if key and key.startswith("l") and key[1:].isdigit():
+        r = con.execute("SELECT source, source_key FROM learned WHERE id=?", (int(key[1:]),)).fetchone()
+        if r and r["source"] == "auto" and r["source_key"]:
+            return r["source_key"]
+    return key
+
+
+def _record_votes(q, helpful, voter, role):
+    sources = json.loads(q["sources"] or "[]")
+    question = re.sub(r"\s*\[screenshot\]$", "", q["question"])
+    role = "sme" if role == "sme" else "agent"
+    keys = []
     with _conn() as con:
-        voters = con.execute("SELECT COUNT(DISTINCT asked_by) FROM questions WHERE region=? AND feedback=1 "
-                             "AND lower(question)=lower(?) AND lower(answer)=lower(?)",
-                             (q["region"], q["question"], q["answer"])).fetchone()[0]
-        if voters < config.AUTO_LEARN_MIN_VOTES and not trusted:
+        for s_ in sources[:2]:             # the passages that produced the answer
+            key = _vote_key(con, s_.get("key"))
+            if key and key not in keys:
+                keys.append(key)
+                con.execute("INSERT INTO feedback_pairs (region, question, source_key, value, at, voter, role, qid) "
+                            "VALUES (?,?,?,?,?,?,?,?)", (q["region"], question, key, 1 if helpful else -1,
+                                                         _now(), voter, role, q["id"]))
+    if keys and config.AUTO_LEARN:
+        _relearn(q, question, keys[0])
+
+
+def _similar_votes(region, question, key=None):
+    """Votes given on questions worded like this one (optionally for one passage only), oldest first."""
+    sql = ("SELECT id, question, source_key, value, voter, role FROM feedback_pairs WHERE region IN (?,?)"
+           + (" AND source_key=?" if key else "") + " ORDER BY id")
+    args = [region, config.GLOBAL_REGION] + ([key] if key else [])
+    with _conn() as con:
+        rows = [dict(r) for r in con.execute(sql, args)]
+    if not rows:
+        return []
+    texts = [r["question"] or "-" for r in rows]
+    vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5)).fit(texts + [question or "-"])
+    sims = cosine_similarity(vec.transform([question or "-"]), vec.transform(texts)).ravel()
+    return [r for r, sim in zip(rows, sims) if sim >= config.FEEDBACK_SIMILARITY]
+
+
+def _tally(rows):
+    """Count people, not clicks: each person's LAST vote counts once. Votes with no name are ignored."""
+    last = {}
+    for r in rows:                         # oldest first, so later votes replace earlier ones
+        if r.get("voter"):
+            last[r["voter"].strip().lower()] = (r["value"], r.get("role") or "agent")
+    agents_up = sum(1 for v, role in last.values() if v > 0 and role != "sme")
+    smes_up = sum(1 for v, role in last.values() if v > 0 and role == "sme")
+    ups = agents_up + smes_up
+    downs = sum(1 for v, _ in last.values() if v < 0)
+    pct = round(100 * ups / (ups + downs)) if ups + downs else 0
+    approved = (agents_up >= config.LEARN_AGENT_VOTES and smes_up >= config.LEARN_SME_VOTES
+                and pct >= config.LEARN_MIN_POSITIVE_PCT)
+    return {"agents_up": agents_up, "smes_up": smes_up, "ups": ups, "downs": downs, "pct": pct,
+            "approved": approved}
+
+
+def vote_status(region, question, key):
+    return _tally(_similar_votes(region, question, key))
+
+
+def _relearn(q, question, key):
+    """Learn (or un-learn) the answer from passage `key` for questions like this one - only by the rule:
+    enough agents and SMEs, and >= 80% 👍. Below that, nothing is learned in either direction."""
+    if not key.startswith("c"):            # only answers taken from documents are auto-learned
+        return
+    t = vote_status(q["region"], question, key)
+    with _conn() as con:
+        mine = con.execute("SELECT id, active FROM learned WHERE region=? AND source='auto' AND source_key=?",
+                           (q["region"], key)).fetchall()
+        if not t["approved"]:
+            for r in mine:                 # an answer that no longer meets the rule is switched off
+                if r["active"]:
+                    con.execute("UPDATE learned SET active=0 WHERE id=?", (r["id"],))
             return
-        same = con.execute("SELECT id FROM learned WHERE region=? AND lower(question)=lower(?)",
-                           (q["region"], question)).fetchone()
-        if same:
-            con.execute("UPDATE learned SET votes=COALESCE(votes,0)+1, active=1 WHERE id=?", (same["id"],))
+        if mine:
+            con.execute("UPDATE learned SET active=1, votes=? WHERE region=? AND source='auto' AND source_key=?",
+                        (t["ups"], q["region"], key))
+            return
+        if q["result"] != "answered" or not (q["answer"] or "").strip():
             return
     vec = None
     if llm.embeddings_on():
@@ -1937,11 +2168,47 @@ def _auto_learn(q, question, trusted=False):
             vec = _vec_to_blob(llm.embed([f"{question}\n{q['answer']}"])[0])
         except llm.AIError:
             pass
+    gds = gds_named(question) or _one_gds(q["answer"]) or ""
     with _conn() as con:
         con.execute("INSERT INTO learned (region, question, answer, added_by, added_at, from_question,"
-                    " source, active, votes, embedding) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                    (q["region"], question, q["answer"], "Vidya (staff 👍)", _now(), q["id"],
-                     "auto", 1, 1, vec))
+                    " source, active, votes, embedding, gds, source_key) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (q["region"], question, q["answer"], "Vidya (agents 👍 + SMEs 👍)", _now(), q["id"],
+                     "auto", 1, t["ups"], vec, gds, key))
+
+
+def sme_vote(qid, sme, helpful=True):
+    """An SME confirms (👍) or rejects (👎) an answer agents rated - counts as an SME vote."""
+    with _conn() as con:
+        q = con.execute("SELECT * FROM questions WHERE id=?", (qid,)).fetchone()
+    if q:
+        _record_votes(q, helpful, sme, "sme")
+
+
+def answers_to_confirm(region=None, limit=40):
+    """Answers agents marked 👍 that still need SME votes (or have them), with the vote counts."""
+    sql = ("SELECT region, source_key, MAX(qid) AS qid FROM feedback_pairs WHERE value=1 AND qid IS NOT NULL "
+           "AND source_key LIKE 'c%' AND COALESCE(role,'agent')='agent'")
+    args = []
+    if region and region != "All":
+        sql += " AND region=?"
+        args.append(region)
+    with _conn() as con:
+        groups = [dict(r) for r in con.execute(sql + " GROUP BY region, source_key", args)]
+        out = []
+        for g in groups:
+            q = con.execute("SELECT * FROM questions WHERE id=?", (g["qid"],)).fetchone()
+            if q:
+                out.append((g, dict(q)))
+    items = []
+    for g, q in out:
+        question = re.sub(r"\s*\[screenshot\]$", "", q["question"] or "")
+        t = vote_status(g["region"], question, g["source_key"])
+        src = json.loads(q["sources"] or "[]")
+        items.append({"qid": q["id"], "region": g["region"], "sub_lob": q.get("sub_lob") or "",
+                      "question": question, "answer": q["answer"] or "", "key": g["source_key"],
+                      "source": (src[0].get("title", "") if src else ""), **t})
+    items.sort(key=lambda x: (x["approved"], -x["agents_up"], -x["pct"]))
+    return items[:limit]
 
 
 def sources_from_documents(q):
@@ -1973,9 +2240,10 @@ def teach(region, question, answer, admin, from_question=None, variants=None):
         except llm.AIError:
             pass
     with _conn() as con:
+        gds = gds_named(question) or _one_gds(answer) or ""      # an SME answer for one GDS stays with it
         con.execute("INSERT INTO learned (region, question, answer, added_by, added_at, from_question,"
-                    " source, active, votes, embedding, variants) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                    (region, question, answer, admin, _now(), from_question, "verified", 1, 0, vec, vtext))
+                    " source, active, votes, embedding, variants, gds) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (region, question, answer, admin, _now(), from_question, "verified", 1, 0, vec, vtext, gds))
         if from_question:
             con.execute("UPDATE questions SET status='resolved', gap_status='Fixed' WHERE id=?",
                         (from_question,))
@@ -2512,6 +2780,85 @@ def questions_df(region=None, days=None, topic=None):
     df["first_source"] = df["sources"].apply(
         lambda s: (json.loads(s)[0]["title"] if s and s != "[]" else ""))
     return df
+
+
+def votes_df(region=None, days=None):
+    """Every 👍 / 👎 with who gave it (agent or SME), the question and the answer it was about."""
+    import pandas as pd
+    sql = ("SELECT f.at, f.region, COALESCE(f.voter,'') AS voter, COALESCE(f.role,'agent') AS role, f.value, "
+           "f.question, f.source_key, f.qid, q.asked_by, q.answer, q.sub_lob, q.sources, q.comment "
+           "FROM feedback_pairs f LEFT JOIN questions q ON q.id = f.qid")
+    where, args = [], []
+    if region and region != "All":
+        where.append("f.region=?"); args.append(region)
+    if days:
+        where.append("f.at>=?"); args.append((datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M"))
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    with _conn() as con:
+        df = pd.read_sql_query(sql + " ORDER BY f.id DESC", con, params=args)
+    if df.empty:
+        return df
+    # one row per answer per person: the same click is stored for up to 2 source passages
+    df = df.drop_duplicates(subset=["qid", "voter", "value", "at"]).copy()
+    df["vote"] = df["value"].map({1: "👍 Helpful", -1: "👎 Not helpful"})
+    df["role"] = df["role"].map({"sme": "SME", "agent": "Agent"}).fillna("Agent")
+    df["source"] = df["sources"].apply(lambda s: (json.loads(s)[0].get("title", "") if s and s != "[]" else ""))
+    return df
+
+
+def feedback_report(region=None, days=None, show="All rated", name=""):
+    """The fix list for the dashboard: question, answer, rating, comment and who asked / rated it."""
+    df = questions_df(region, days)
+    if df.empty:
+        return df
+    if show == "👎 Not helpful":
+        df = df[df["feedback"] == -1]
+    elif show == "👍 Helpful":
+        df = df[df["feedback"] == 1]
+    elif show == "All rated":
+        df = df[df["feedback"].notna()]
+    elif show == "No answer / conflict":
+        df = df[df["result"].isin(["not_found", "conflict"])]
+    if name.strip():
+        df = df[df["asked_by"].fillna("").str.contains(name.strip(), case=False, regex=False)]
+    out = df.assign(
+        Rating=df["feedback"].map({1: "👍 Helpful", -1: "👎 Not helpful"}).fillna("Not rated"),
+        Question=df["question"].map(lambda t: re.sub(r"\s*\[screenshot\]$", " (with screenshot)", t or "")),
+        Answer=df["answer"].fillna("").map(lambda t: t if len(t) <= 600 else t[:600] + " …"))
+    cols = {"asked_at": "Asked at", "asked_by": "Asked by", "region": "LOB", "sub_lob": "Sub-LOB",
+            "Question": "Question", "Answer": "Vidya's answer", "result": "Result",
+            "confidence_pct": "Confidence %", "first_source": "Source", "Rating": "Rating",
+            "comment": "Comment (what was wrong)", "gap_status": "Fix status", "id": "Question ID"}
+    return out[list(cols)].rename(columns=cols)
+
+
+def report_excel(report, votes):
+    """Excel: the fix list + every vote with who gave it."""
+    import pandas as pd
+    from openpyxl.styles import Alignment, Font, PatternFill
+    buf = io.BytesIO()
+    vcols = {"at": "Rated at", "voter": "Rated by", "role": "Role", "vote": "Rating", "region": "LOB",
+             "sub_lob": "Sub-LOB", "question": "Question", "asked_by": "Asked by", "answer": "Vidya's answer",
+             "source": "Source", "comment": "Comment", "qid": "Question ID"}
+    vdf = (votes[list(vcols)].rename(columns=vcols) if votes is not None and not votes.empty
+           else pd.DataFrame(columns=list(vcols.values())))
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        report.to_excel(xw, sheet_name="Questions & feedback", index=False)
+        vdf.to_excel(xw, sheet_name="All votes (who rated)", index=False)
+        for ws in xw.book.worksheets:
+            for c in ws[1]:
+                c.font = Font(bold=True, color="FFFFFF")
+                c.fill = PatternFill("solid", fgColor="1F5FBF")
+                c.alignment = Alignment(vertical="center", wrap_text=True)
+            ws.freeze_panes = "A2"
+            for col in ws.columns:
+                head = str(col[0].value or "")
+                wide = 60 if head in ("Question", "Vidya's answer", "Comment (what was wrong)", "Comment") else 18
+                ws.column_dimensions[col[0].column_letter].width = wide
+                for c in col[1:]:
+                    c.alignment = Alignment(vertical="top", wrap_text=wide == 60)
+    return buf.getvalue()
 
 
 def export_excel(df, gaps):

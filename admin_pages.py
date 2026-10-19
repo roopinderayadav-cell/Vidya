@@ -128,6 +128,38 @@ def dashboard(region, user):
                    "confidence_pct", "helpful"]]
         st.dataframe(show, hide_index=True, width="stretch")
 
+    feedback_report(reg, PERIODS[period])
+
+
+def feedback_report(reg, days):
+    """Questions + feedback + names, to find and fix wrong answers. Card numbers are already masked."""
+    st.markdown("<div class='om-section'>📋 Questions & feedback report - find what to fix</div>",
+                unsafe_allow_html=True)
+    c1, c2, c3 = st.columns([1.3, 1.3, 1.2])
+    show = c1.selectbox("Show", ["👎 Not helpful", "All rated", "👍 Helpful", "No answer / conflict",
+                                 "All questions"], key="rep_show")
+    name = c2.text_input("Asked by (name contains)", key="rep_name")
+    rep = kb.feedback_report(reg, days, show, name)
+    votes = kb.votes_df(reg, days)
+    if name.strip() and not votes.empty:
+        votes = votes[votes["voter"].str.contains(name.strip(), case=False, regex=False)
+                      | votes["asked_by"].fillna("").str.contains(name.strip(), case=False, regex=False)]
+    c3.write("")
+    c3.download_button("⬇ Download report (Excel)", kb.report_excel(rep, votes), type="primary",
+                       file_name=f"Vidya_feedback_report_{datetime.now():%Y-%m-%d}.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                       width="stretch", key="rep_dl")
+    if rep.empty:
+        st.caption("Nothing to show for this filter.")
+    else:
+        st.caption(f"{len(rep)} question(s). The Excel also has every vote with who gave it (agent or SME).")
+        st.dataframe(rep, hide_index=True, width="stretch", height=min(420, 38 + 35 * len(rep)))
+    if not votes.empty:
+        with st.expander(f"Who rated what ({len(votes)} votes)"):
+            st.dataframe(votes[["at", "voter", "role", "vote", "region", "question", "asked_by"]].rename(
+                columns={"at": "Rated at", "voter": "Rated by", "role": "Role", "vote": "Rating", "region": "LOB",
+                         "question": "Question", "asked_by": "Asked by"}), hide_index=True, width="stretch")
+
 
 # ---------------------------------------------------------------------------
 # DOCUMENT MANAGEMENT
@@ -312,9 +344,11 @@ def sme_desk(region, user):
                "Write the correct answer once - Vidya uses it for this and similar questions from then on. "
                "Uploaded SOPs and documents are not changed.")
     n_wait, n_rev = len(kb.waiting_chats()), len(kb.chats_to_review(sme=user))
-    t1, tc, t2, th = st.tabs(["⏳ Waiting for an SME", f"💬 Live chat ({n_wait} waiting"
-                              + (f", {n_rev} to save" if n_rev else "") + ")",
-                              "✅ Answers given by SMEs", "🗂️ Chat history"])
+    t1, tc, t2, tv, th = st.tabs(["⏳ Waiting for an SME", f"💬 Live chat ({n_wait} waiting"
+                                  + (f", {n_rev} to save" if n_rev else "") + ")",
+                                  "✅ Answers given by SMEs", "👍 Answers to confirm", "🗂️ Chat history"])
+    with tv:
+        _sme_confirm(region, user)
     with tc:
         _sme_live(region, user)
     with th:
@@ -343,6 +377,37 @@ def sme_desk(region, user):
             st.rerun()
     with t2:
         _sme_answers(region, user)
+
+
+def _sme_confirm(region, user):
+    """Answers agents marked 👍: an SME confirms (👍) or rejects (👎). Vidya learns an answer only when
+    it has 👍 from LEARN_AGENT_VOTES agents + LEARN_SME_VOTES SMEs and LEARN_MIN_POSITIVE_PCT % positive."""
+    st.caption(f"Vidya learns an answer only with 👍 from **{config.LEARN_AGENT_VOTES} agents** and "
+               f"**{config.LEARN_SME_VOTES} SMEs**, and **{config.LEARN_MIN_POSITIVE_PCT}%+** of everyone "
+               "who rated it saying 👍. Check the answer against the SOP before you confirm it.")
+    lob = st.selectbox("LOB", [region, "All"] + [r for r in config.REGIONS if r != region], key="conf_lob")
+    items = kb.answers_to_confirm(None if lob == "All" else lob)
+    if not items:
+        st.info("No answers with agent 👍 yet.")
+        return
+    for n, x in enumerate(items):
+        with st.container(border=True):
+            a, b = st.columns([5, 1.3])
+            state = ("🟢 learned - in use" if x["approved"] else
+                     "🟡 waiting for votes" if x["pct"] >= config.LEARN_MIN_POSITIVE_PCT else
+                     f"🔴 below {config.LEARN_MIN_POSITIVE_PCT}% positive - not learned")
+            a.markdown(ui.region_pill(x["region"]) + (f" {ui.esc(x['sub_lob'])}" if x["sub_lob"] else "")
+                       + f" **Q:** {ui.esc(x['question'])}", unsafe_allow_html=True)
+            a.markdown(privacy.mask_md(x["answer"][:1200]))
+            a.caption(f"{state} · agents 👍 {x['agents_up']}/{config.LEARN_AGENT_VOTES} · SMEs 👍 "
+                      f"{x['smes_up']}/{config.LEARN_SME_VOTES} · 👎 {x['downs']} · {x['pct']}% positive"
+                      + (f" · source: {x['source']}" if x["source"] else ""))
+            if b.button("👍 Correct", key=f"smeok{n}_{x['qid']}", type="primary", width="stretch"):
+                kb.sme_vote(x["qid"], user, True)
+                st.rerun()
+            if b.button("👎 Not correct", key=f"smeno{n}_{x['qid']}", width="stretch"):
+                kb.sme_vote(x["qid"], user, False)
+                st.rerun()
 
 
 def _sme_card(n, g, user):
@@ -687,9 +752,10 @@ def gaps(region, user):
 # ---------------------------------------------------------------------------
 def learned(region, user):
     st.header("Learned Answers")
-    st.caption("Verified answers come from the process team. Auto-learned answers are saved by Vidya "
-               f"when {config.AUTO_LEARN_MIN_VOTES} different people (or one admin) mark the same answer 👍; "
-               "a 👎 switches an auto-learned answer off automatically.")
+    st.caption("Verified answers come from the process team. Auto-learned answers: " + f"Vidya learns from 👍 only when {config.LEARN_AGENT_VOTES} different agents and "
+               f"{config.LEARN_SME_VOTES} different SMEs gave 👍 to the same answer, and at least "
+               f"{config.LEARN_MIN_POSITIVE_PCT}% of everyone who rated it gave 👍. If 👍 drops below that, the "
+               "answer is switched off again automatically. Below the rule, votes change nothing.")
     t1, t2, t3 = st.tabs(["✅ Verified", "🧠 Auto-learned (staff 👍)", "➕ Add a Q&A"])
     with t1:
         rows = kb.list_learned(region, "verified") + kb.list_learned(config.GLOBAL_REGION, "verified")
@@ -854,9 +920,12 @@ def settings(region, user):
         st.warning(config.CONFLICT_TEXT)
         st.caption("Change these wordings in config.py (FALLBACK_TEXT, CONFLICT_TEXT).")
         st.markdown("<div class='om-section'>Self-learning</div>", unsafe_allow_html=True)
-        st.write(f"Auto-learn from 👍: **{'On' if config.AUTO_LEARN else 'Off'}** - after 👍 from "
-                 f"{config.AUTO_LEARN_MIN_VOTES} different people, or 1 admin")
-        st.write("👍 / 👎 also move passages up / down for similar questions; new uploads re-check open gaps.")
+        st.write(f"Auto-learn from 👍: **{'On' if config.AUTO_LEARN else 'Off'}** - needs 👍 from "
+                 f"**{config.LEARN_AGENT_VOTES} agents + {config.LEARN_SME_VOTES} SMEs** and "
+                 f"**{config.LEARN_MIN_POSITIVE_PCT}%+ positive**; below that, no learning either way.")
+        st.write("👎 always sends the question to the SME Desk. New uploads re-check open gaps.")
+        st.write(f"GDS questions: Vidya always asks **{' or '.join(config.GDS_OPTIONS)}** when the agent "
+                 f"does not say ({'On' if config.GDS_ALWAYS_ASK else 'Off'}).")
 
 
 def lob_settings(user):
