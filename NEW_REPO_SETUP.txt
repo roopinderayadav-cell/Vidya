@@ -1,0 +1,43 @@
+Vidya v5.1 - set up as a NEW GitHub repository and a NEW Streamlit app
+======================================================================
+
+A. Before you start (in the OLD iKnow app)
+   1. Sign in as Admin -> Settings -> Backup -> "Download backup". Keep the .zip safe.
+      (It holds all documents, SME answers, chats and learned answers - card numbers already masked.)
+
+B. New GitHub repository
+   1. github.com -> "+" -> New repository. Name: vidya. Visibility: PRIVATE. Create.
+   2. "uploading an existing file" -> drag in EVERYTHING from this folder:
+        app.py, admin_pages.py, knowledge.py, brain.py, llm.py, rerank.py, config.py, privacy.py, prompts.py,
+        ui.py, test_vidya.py, requirements.txt, packages.txt, START_APP.bat, README.md,
+        LOCAL_AI_SETUP.md, .gitignore, and the folders assets, templates, sample_docs, demo_files,
+        .streamlit
+      Tip: hidden items (.gitignore, .streamlit) - on Windows turn on View -> Hidden items, or drag
+      the whole folder's contents at once.
+   3. Commit message: "Vidya v5.1 - first version" -> Commit changes.
+   4. Check that assets/vidya_logo.png, assets/vidya_icon.png and .streamlit/config.toml are there.
+
+C. New Streamlit app
+   1. share.streamlit.io -> Create app -> from GitHub -> repository "vidya", branch main,
+      main file app.py. App URL: e.g. vidya-yourteam.
+   2. Advanced settings -> Python 3.13 -> Secrets (each on ONE line):
+        ADMIN_PASSWORD = "a-strong-admin-password"
+        SME_PASSWORD = "a-strong-sme-password"
+        GEMINI_API_KEY = "your-NEW-gemini-key"
+      Do NOT add AI_PROVIDER = "local" here (the cloud app cannot reach Ollama on your laptop).
+   3. Deploy. The first start takes 3-5 minutes (it installs the libraries and Tesseract).
+
+D. Bring your knowledge across
+   1. Sign in to Vidya as Admin -> Settings -> Restore from a backup .zip -> choose the iKnow backup ->
+      "Restore now". (Anything that was under QBAY is no longer shown - QBAY was removed.)
+   2. Settings -> "Test AI connection", then "Build semantic index now" (once).
+   3. Try: "BLR airport", "what is TST", and type a 13- or 16-digit number in the question box - it
+      must turn into *********1234 while you type.
+   4. Settings -> Reranker: "loading" for a few minutes the first time, then "ready".
+   5. Post a test announcement (menu Vidya -> Announcements) and check the red running line.
+
+E. When Vidya works, switch off the old iKnow app (share.streamlit.io -> ... -> Delete) and
+   delete its Gemini key in Google AI Studio, so only one app and one key are in use.
+
+Laptop with Ollama: download this folder, double-click START_APP.bat - Vidya finds Ollama by
+itself (LOCAL_AI_SETUP.md, section C).
